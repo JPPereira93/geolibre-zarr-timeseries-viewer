@@ -11,7 +11,8 @@ GeoLibre source change. It adds:
 - local Zarr folders and remote Zarr v2 and v3 stores;
 - configurable variables, time dimensions, regular or explicit coordinates;
 - CRS, spatial dimensions, source bounds, and WGS84 map extents;
-- variable discovery for local stores and direct acquisition selection;
+- variable discovery for local and consolidated remote stores, plus direct
+  acquisition selection;
 - adding the current acquisition as a separate map layer for comparison;
 - exporting the current acquisition at full resolution as a tiled, overviewed
   Cloud Optimized GeoTIFF, deriving its WGS84 footprint from projected source
@@ -34,6 +35,7 @@ Open **Data source and display settings** in the panel to configure another
 dataset. Use **Choose Zarr folder** for a directory on disk. Consolidated Zarr
 v2 metadata is used to prefill the variable, dimensions, time count, date units,
 CRS, bounds, color range, and available variables when present. A store nested
-inside a selected wrapper folder is detected automatically. Remote stores must
-permit browser CORS requests. The sample remains available as the **Bundled NDVI
-example** preset.
+inside a selected wrapper folder is detected automatically. For a remote URL,
+choose **Read metadata and variables** before adding the layer. Remote stores
+must permit browser CORS requests and expose consolidated metadata. The sample
+remains available as the **Bundled NDVI example** preset.

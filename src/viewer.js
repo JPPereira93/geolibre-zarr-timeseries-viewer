@@ -1,8 +1,13 @@
 import { CogBuilder, ZarrLayer, initCogWasm, proj4 } from "./runtime.js";
+import {
+  configFromMetadata,
+  normalizeStoreUrl,
+  readRemoteMetadata,
+} from "./metadata.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -77,6 +82,9 @@ let exportingAcquisition = false;
 let cfg = { ...SAMPLE };
 let localStore = null;
 let localStoreId = "";
+let bundledStore = null;
+let metadataController = null;
+let remoteMetadata = null;
 const nativeLayers = new Map();
 let cogWasmReady = null;
 const esc = (value) =>
@@ -163,7 +171,7 @@ function sourceUrl(config) {
     );
     if (!metadata)
       throw new Error("The bundled example URL could not be resolved.");
-    return new URL(".", metadata).toString().replace(/\/$/, "");
+    return metadata;
   }
   if (config.source === "local") {
     if (!localStore) throw new Error("Choose the Zarr folder again.");
@@ -171,13 +179,38 @@ function sourceUrl(config) {
       config.url || "zarr"
     )}?${localStoreId}`;
   }
-  const url = config.url
-    .trim()
-    .replace(/\/(?:\.zmetadata|zarr\.json)\/?$/, "")
-    .replace(/\/$/, "");
-  if (!/^https?:\/\//i.test(url))
-    throw new Error("Enter an HTTP or HTTPS Zarr store URL.");
-  return url;
+  return normalizeStoreUrl(config.url);
+}
+
+function sampleStore() {
+  if (bundledStore) return bundledStore;
+  bundledStore = {
+    async get(key) {
+      const cleanKey = String(key).replace(/^\/+/, "");
+      if (
+        !cleanKey ||
+        cleanKey.split("/").some((part) => !part || part === "." || part === "..")
+      )
+        return undefined;
+      const url = app.resolvePluginAssetUrl?.(
+        ID,
+        `data/ndvi_smoothed.zarr/${cleanKey}`,
+      );
+      if (!url) return undefined;
+      const response = await fetch(url);
+      if (response.status === 404) return undefined;
+      if (!response.ok)
+        throw new Error(`Could not read bundled Zarr asset ${cleanKey}.`);
+      return new Uint8Array(await response.arrayBuffer());
+    },
+  };
+  return bundledStore;
+}
+
+function storeForConfig(config) {
+  if (config.source === "sample") return sampleStore();
+  if (config.source === "local") return localStore;
+  return null;
 }
 
 function proj4Definition(config = cfg) {
@@ -264,7 +297,9 @@ async function addNativeZarrLayer(name, config, selector) {
   }
   const layer = new ZarrLayer({
     id,
-    ...(config.source === "local" ? { store: localStore } : { source: sourceUrl(config) }),
+    ...(storeForConfig(config)
+      ? { store: storeForConfig(config) }
+      : { source: sourceUrl(config) }),
     variable: config.variable,
     selector,
     clim: [Number(config.climMin), Number(config.climMax)],
@@ -323,6 +358,46 @@ async function addNativeZarrLayer(name, config, selector) {
     throw error;
   }
   return id;
+}
+
+async function inspectRemoteStore(form) {
+  metadataController?.abort();
+  metadataController = new AbortController();
+  const next = readForm(form);
+  next.source = "custom";
+  status("Reading remote Zarr metadata…");
+  try {
+    const discovered = await readRemoteMetadata(
+      next.url,
+      fetch,
+      metadataController.signal,
+    );
+    remoteMetadata = discovered.metadata;
+    const detected = configFromMetadata(discovered.metadata, {
+      ...next,
+      url: discovered.url,
+      zarrVersion: discovered.zarrVersion,
+      sourceBounds: "",
+      mapBounds: "",
+    });
+    cfg = detected;
+    values = [];
+    labels = [];
+    render();
+    panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+    status(
+      `Found ${detected.availableVariables.length} data variable${
+        detected.availableVariables.length === 1 ? "" : "s"
+      }. Select one, review the display range, then add the time series.`,
+      "success",
+    );
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") return;
+    status(
+      error instanceof Error ? error.message : "Could not inspect this Zarr store.",
+      "error",
+    );
+  }
 }
 async function chooseFolder(fileList) {
   const files = [...fileList];
@@ -890,7 +965,7 @@ async function load(next = cfg) {
     const nextLayerId = await addNativeZarrLayer(
       cfg.name || `${cfg.variable} time series`,
       cfg,
-      cfg.source === "local" ? undefined : { [cfg.timeDimension]: values[frame] },
+      cfg.source === "sample" ? { [cfg.timeDimension]: values[frame] } : undefined,
     );
     if (!app || !nativeLayers.has(nextLayerId)) {
       removeNativeLayer(nextLayerId);
@@ -975,7 +1050,7 @@ function formHtml() {
     }</option>`;
   const availableVariables = cfg.availableVariables ?? [];
   const variableControl =
-    cfg.source === "local" && availableVariables.length
+    availableVariables.length
       ? `<select name="variable" required>${availableVariables
           .map(
             (name) =>
@@ -1000,7 +1075,7 @@ function formHtml() {
     }</span></div>
     <label class="ztsv-wide">Zarr store URL<input name="url" value="${esc(
       cfg.url
-    )}" placeholder="https://example.com/cube.zarr"/></label>
+    )}" placeholder="https://example.com/cube.zarr"/></label><button class="ztsv-secondary ztsv-wide" type="button" data-inspect-url>Read metadata and variables</button>
     <label>Layer name<input name="name" value="${esc(
       cfg.name
     )}"/></label><label>Variable${variableControl}</label>
@@ -1143,6 +1218,7 @@ function render() {
     ?.addEventListener("change", (event) => {
       if (event.currentTarget.value !== "custom") return;
       localStore = null;
+      remoteMetadata = null;
       const form = event.currentTarget.form;
       form.elements.url.value = "";
       form.elements.name.value = "Zarr time series";
@@ -1156,6 +1232,35 @@ function render() {
       form.elements.proj4.value = "";
       form.elements.sourceBounds.value = "";
       form.elements.mapBounds.value = "";
+    });
+  const remoteUrlInput = panel.querySelector('[name="url"]');
+  panel
+    .querySelector("[data-inspect-url]")
+    ?.addEventListener("click", (event) =>
+      void inspectRemoteStore(event.currentTarget.form),
+    );
+  remoteUrlInput?.addEventListener("change", (event) => {
+    const form = event.currentTarget.form;
+    if (form?.elements.source.value === "custom" && event.currentTarget.value.trim())
+      void inspectRemoteStore(form);
+  });
+  panel
+    .querySelector('[name="variable"]')
+    ?.addEventListener("change", (event) => {
+      const form = event.currentTarget.form;
+      if (!remoteMetadata || form?.elements.source.value !== "custom") return;
+      cfg = configFromMetadata(remoteMetadata, {
+        ...readForm(form),
+        variable: event.currentTarget.value,
+      });
+      values = [];
+      labels = [];
+      render();
+      panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+      status(
+        `${cfg.variable} selected. Review the display range, then add the time series.`,
+        "success",
+      );
     });
   const folderInput = panel.querySelector("[data-folder-input]");
   panel
@@ -1283,6 +1388,10 @@ const plugin = {
     panel = null;
     control = null;
     unregister = null;
+    metadataController?.abort();
+    metadataController = null;
+    remoteMetadata = null;
+    bundledStore = null;
     app = null;
   },
   getProjectState() {
