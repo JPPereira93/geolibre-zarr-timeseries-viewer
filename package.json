@@ -1,0 +1,19 @@
+{
+  "name": "geolibre-zarr-timeseries-viewer",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test",
+    "package": "python %USERPROFILE%/.codex/skills/geolibre-plugin-development/scripts/package_plugin.py ."
+  },
+  "dependencies": {
+    "@carbonplan/zarr-layer": "0.11.0",
+    "geolibre-wasm": "1.5.8",
+    "proj4": "2.22.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

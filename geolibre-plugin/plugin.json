@@ -1,0 +1,7 @@
+{
+  "id": "zarr-timeseries-viewer",
+  "name": "Zarr Time Series Viewer",
+  "version": "0.6.0",
+  "entry": "viewer.js",
+  "style": "style.css"
+}

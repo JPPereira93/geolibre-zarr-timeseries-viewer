@@ -1,0 +1,11 @@
+{
+    "cloud_mask": "SCL [3, 9, 10] buffered by 2 px; SCL [0, 1, 8] masked without buffer",
+    "min_valid_pct": 30,
+    "note": "Values between observations are interpolated; pixels outside the AOI polygon are NaN",
+    "outlier_removal": "14-day centred rolling median, relative threshold 0.1",
+    "period": "2016-01-01 to 2026-01-01",
+    "smoothing": "Savitzky-Golay, 90-day window, polyorder 2, then 5D means",
+    "source": "Sentinel-2 Level-2A imagery",
+    "time_step": "5D",
+    "title": "Cleaned and smoothed Sentinel-2 NDVI for the AOI polygon"
+}
