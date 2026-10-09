@@ -1,13 +1,18 @@
 import { CogBuilder, ZarrLayer, initCogWasm, proj4 } from "./runtime.js";
+import * as zarr from "zarrita";
 import {
   configFromMetadata,
+  configFromLayerSpatialMetadata,
+  finiteRange,
+  metadataFromDocument,
   normalizeStoreUrl,
   readRemoteMetadata,
 } from "./metadata.js";
+import { axisLabels, timeAxis } from "./time-axis.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.0";
+const VERSION = "0.7.2";
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -84,7 +89,7 @@ let localStore = null;
 let localStoreId = "";
 let bundledStore = null;
 let metadataController = null;
-let remoteMetadata = null;
+let inspectedMetadata = null;
 const nativeLayers = new Map();
 let cogWasmReady = null;
 const esc = (value) =>
@@ -102,47 +107,6 @@ function list(value, length, label) {
   if (result.length !== length || result.some((item) => !Number.isFinite(item)))
     throw new Error(`${label} must contain ${length} numbers.`);
   return result;
-}
-function timeAxis(config) {
-  const tokens = String(config.timeValuesText ?? "")
-    .split(/[\n,]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  const axis = tokens.length
-    ? tokens.map((token) =>
-        Number.isFinite(Number(token)) ? Number(token) : token
-      )
-    : Array.from(
-        { length: Math.round(Number(config.timeCount)) },
-        (_, index) => Number(config.timeStart) + index * Number(config.timeStep)
-      );
-  if (
-    !axis.length ||
-    axis.length > 1e4 ||
-    axis.some((item) => typeof item === "number" && !Number.isFinite(item))
-  ) {
-    throw new Error(
-      "The time axis must contain between 1 and 10,000 valid coordinates."
-    );
-  }
-  return { values: axis, labels: axisLabels(axis, config) };
-}
-function axisLabels(axis, config) {
-  const origin = Date.parse(config.dateOrigin);
-  const unit =
-    { milliseconds: 1, seconds: 1e3, minutes: 6e4, hours: 36e5, days: 864e5 }[
-      config.dateUnit
-    ] ?? 1;
-  return axis.map((value) =>
-    Number.isFinite(origin) && typeof value === "number"
-      ? new Intl.DateTimeFormat(void 0, {
-          year: "numeric",
-          month: "short",
-          day: "2-digit",
-          timeZone: "UTC",
-        }).format(new Date(origin + value * unit))
-      : `${config.timeDimension} ${value}`
-  );
 }
 function colors(config = cfg) {
   if (config.palette !== "custom")
@@ -189,12 +153,14 @@ function sampleStore() {
       const cleanKey = String(key).replace(/^\/+/, "");
       if (
         !cleanKey ||
-        cleanKey.split("/").some((part) => !part || part === "." || part === "..")
+        cleanKey
+          .split("/")
+          .some((part) => !part || part === "." || part === "..")
       )
         return undefined;
       const url = app.resolvePluginAssetUrl?.(
         ID,
-        `data/ndvi_smoothed.zarr/${cleanKey}`,
+        `data/ndvi_smoothed.zarr/${cleanKey}`
       );
       if (!url) return undefined;
       const response = await fetch(url);
@@ -223,7 +189,9 @@ function proj4Definition(config = cfg) {
   if (!match) return undefined;
   const zone = Number(match[2]);
   if (zone < 1 || zone > 60) return undefined;
-  return `+proj=utm +zone=${zone}${match[1] === "327" ? " +south" : ""} +datum=WGS84 +units=m +no_defs`;
+  return `+proj=utm +zone=${zone}${
+    match[1] === "327" ? " +south" : ""
+  } +datum=WGS84 +units=m +no_defs`;
 }
 
 function sourceProjection(config = cfg) {
@@ -233,7 +201,8 @@ function sourceProjection(config = cfg) {
 
 function sourceBoundsGeometry(config = cfg) {
   const bounds = list(config.sourceBounds, 4, "Source bounds");
-  if (!bounds) throw new Error("Source bounds are required for this operation.");
+  if (!bounds)
+    throw new Error("Source bounds are required for this operation.");
   const [xMin, yMin, xMax, yMax] = bounds;
   const ring = [];
   const samples = 16;
@@ -249,7 +218,7 @@ function sourceBoundsGeometry(config = cfg) {
   const coordinates = ring.map((coordinate) =>
     projection === "EPSG:4326" || projection === "OGC:CRS84"
       ? coordinate
-      : proj4(projection, "EPSG:4326", coordinate),
+      : proj4(projection, "EPSG:4326", coordinate)
   );
   coordinates.push(coordinates[0]);
   return { type: "Polygon", coordinates: [coordinates] };
@@ -265,6 +234,13 @@ function datasetMapBounds(config = cfg) {
     Math.max(...coordinates.map(([x]) => x)),
     Math.max(...coordinates.map(([, y]) => y)),
   ];
+}
+
+function applyLayerSpatialMetadata(layer, config) {
+  Object.assign(config, configFromLayerSpatialMetadata(layer, config));
+  if (!String(config.mapBounds ?? "").trim() && config.sourceBounds) {
+    config.mapBounds = datasetMapBounds(config).join(", ");
+  }
 }
 
 function activeLayer(id = layerId) {
@@ -319,45 +295,70 @@ async function addNativeZarrLayer(name, config, selector) {
   });
   map.addLayer(layer);
   nativeLayers.set(id, { layer, name, mapBounds, map, host });
-  host.registerExternalNativeLayer?.({
-    id,
-    name,
-    type: "zarr",
-    nativeLayerIds: [id],
-    opacity: 0.9,
-    paintMode: "plugin",
-    paintBridge: {
-      setOpacity: (opacity) => layer.setOpacity(opacity),
-      setVisibility: (visible) => layer.setOpacity(visible ? 0.9 : 0),
-    },
-    source: {
-      type: "raster",
-      url: sourceUrl(config),
-      variable: config.variable,
-      selector,
-      ...(mapBounds ? { bounds: mapBounds } : {}),
-    },
-    metadata: {
-      sourceKind: "zarr-url",
-      paintMode: "plugin",
-      variable: config.variable,
-      selector,
-      ...(config.crs.trim() ? { crs: config.crs.trim() } : {}),
-      ...(mapBounds ? { bounds: mapBounds } : {}),
-    },
-    sourcePath: sourceUrl(config),
-  });
   try {
     await layer.ready;
     if (app !== host || !nativeLayers.has(id)) {
       removeNativeLayer(id);
       throw new DOMException("Zarr viewer deactivated.", "AbortError");
     }
+    applyLayerSpatialMetadata(layer, config);
+    mapBounds = datasetMapBounds(config);
+    nativeLayers.get(id).mapBounds = mapBounds;
+    host.registerExternalNativeLayer?.({
+      id,
+      name,
+      type: "zarr",
+      nativeLayerIds: [id],
+      opacity: 0.9,
+      paintMode: "plugin",
+      paintBridge: {
+        setOpacity: (opacity) => layer.setOpacity(opacity),
+        setVisibility: (visible) => layer.setOpacity(visible ? 0.9 : 0),
+      },
+      source: {
+        type: "raster",
+        url: sourceUrl(config),
+        variable: config.variable,
+        selector,
+        bounds: mapBounds,
+      },
+      metadata: {
+        sourceKind: "zarr-url",
+        paintMode: "plugin",
+        variable: config.variable,
+        selector,
+        ...(config.crs.trim() ? { crs: config.crs.trim() } : {}),
+        bounds: mapBounds,
+      },
+      sourcePath: sourceUrl(config),
+    });
   } catch (error) {
     removeNativeLayer(id);
     throw error;
   }
   return id;
+}
+
+function applyInspectedMetadata(metadata, next, zarrVersion) {
+  inspectedMetadata = metadata;
+  cfg = configFromMetadata(metadata, {
+    ...next,
+    zarrVersion,
+    crs: "",
+    proj4: "",
+    sourceBounds: "",
+    mapBounds: "",
+  });
+  values = [];
+  labels = [];
+  render();
+  panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+  status(
+    `Found ${cfg.availableVariables.length} data variable${
+      cfg.availableVariables.length === 1 ? "" : "s"
+    }. Select one, review the display range, then add the time series.`,
+    "success"
+  );
 }
 
 async function inspectRemoteStore(form) {
@@ -370,34 +371,52 @@ async function inspectRemoteStore(form) {
     const discovered = await readRemoteMetadata(
       next.url,
       fetch,
-      metadataController.signal,
+      metadataController.signal
     );
-    remoteMetadata = discovered.metadata;
-    const detected = configFromMetadata(discovered.metadata, {
-      ...next,
-      url: discovered.url,
-      zarrVersion: discovered.zarrVersion,
-      sourceBounds: "",
-      mapBounds: "",
-    });
-    cfg = detected;
-    values = [];
-    labels = [];
-    render();
-    panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
-    status(
-      `Found ${detected.availableVariables.length} data variable${
-        detected.availableVariables.length === 1 ? "" : "s"
-      }. Select one, review the display range, then add the time series.`,
-      "success",
+    applyInspectedMetadata(
+      discovered.metadata,
+      {
+        ...next,
+        url: discovered.url,
+      },
+      discovered.zarrVersion
     );
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") return;
     status(
-      error instanceof Error ? error.message : "Could not inspect this Zarr store.",
-      "error",
+      error instanceof Error
+        ? error.message
+        : "Could not inspect this Zarr store.",
+      "error"
     );
   }
+}
+
+function inspectLocalStore(form) {
+  if (!localStore || !inspectedMetadata) {
+    throw new Error("Choose a Zarr folder before reading its metadata.");
+  }
+  const next = readForm(form);
+  applyInspectedMetadata(
+    inspectedMetadata,
+    { ...next, source: "local", url: cfg.url },
+    cfg.zarrVersion
+  );
+}
+async function inspectLocalDisplayRange() {
+  if (!localStore || cfg.hasDeclaredRange) return null;
+  const root = await zarr.open(localStore, { kind: "group" });
+  const array = await zarr.open(root.resolve(cfg.variable), { kind: "array" });
+  const chunk = await array.getChunk(Array(array.shape.length).fill(0));
+  return finiteRange(chunk.data);
+}
+async function applyLocalDisplayRange() {
+  const range = await inspectLocalDisplayRange();
+  if (!range) return null;
+  cfg = { ...cfg, climMin: range[0], climMax: range[1] };
+  render();
+  panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+  return range;
 }
 async function chooseFolder(fileList) {
   const files = [...fileList];
@@ -440,149 +459,34 @@ async function chooseFolder(fileList) {
     },
   };
   localStoreId = crypto.randomUUID();
-  const next = {
-    ...cfg,
-    source: "local",
-    url: storeName,
-    name: storeName,
-    sourceBounds: "",
-    mapBounds: "",
-  };
-  const consolidated = index.get(".zmetadata");
-  if (consolidated) {
-    const document2 = JSON.parse(await consolidated.text());
-    const metadata = document2.metadata ?? {};
-    const arrays = Object.entries(metadata)
-      .filter(
-        ([key, value]) =>
-          key.endsWith("/.zarray") &&
-          Array.isArray(value?.shape) &&
-          value.shape.length >= 3
-      )
-      .map(([key, value]) => ({ name: key.slice(0, -8), array: value }));
-    const variable = arrays[0];
-    if (variable) {
-      const dimensions =
-        metadata[`${variable.name}/.zattrs`]?._ARRAY_DIMENSIONS ?? [];
-      const variableAttrs = metadata[`${variable.name}/.zattrs`] ?? {};
-      const timeDimension =
-        dimensions.find(
-          (name) =>
-            !["x", "y", "lon", "lat", "longitude", "latitude"].includes(
-              String(name).toLowerCase()
-            )
-        ) ??
-        dimensions[0] ??
-        "time";
-      const timeIndex = dimensions.indexOf(timeDimension);
-      next.variable = variable.name;
-      next.availableVariables = arrays.map((item) => item.name);
-      next.valueLabel =
-        variableAttrs.long_name ?? variableAttrs.standard_name ?? "";
-      next.timeDimension = timeDimension;
-      next.timeCount =
-        variable.array.shape[timeIndex >= 0 ? timeIndex : 0] ?? 1;
-      next.xDimension =
-        dimensions.find((name) =>
-          ["x", "lon", "longitude"].includes(String(name).toLowerCase())
-        ) ?? "x";
-      next.yDimension =
-        dimensions.find((name) =>
-          ["y", "lat", "latitude"].includes(String(name).toLowerCase())
-        ) ?? "y";
-      const xIndex = dimensions.indexOf(next.xDimension);
-      const yIndex = dimensions.indexOf(next.yDimension);
-      next.gridVariable = variable.name;
-      next.gridWidth = variable.array.shape[xIndex];
-      next.gridHeight = variable.array.shape[yIndex];
-      next.nodata = Number.isFinite(Number(variable.array.fill_value))
-        ? Number(variable.array.fill_value)
-        : -9999;
-      const coordinate = metadata[`${timeDimension}/.zattrs`] ?? {};
-      const units = String(coordinate.units ?? "").match(
-        /^(milliseconds|seconds|minutes|hours|days)\s+since\s+(.+)$/i
-      );
-      if (units) {
-        next.dateUnit = units[1].toLowerCase();
-        next.dateOrigin = units[2];
-      }
-      const rootAttrs = metadata[".zattrs"] ?? {};
-      next.palette =
-        variable.name.toLowerCase() === "ndvi" ? "ndvi" : "viridis";
-      const declaredRange =
-        variableAttrs.actual_range ??
-        variableAttrs.valid_range ??
-        rootAttrs.variable_ranges?.[variable.name];
-      if (
-        Array.isArray(declaredRange) &&
-        declaredRange.length >= 2 &&
-        declaredRange.every(Number.isFinite)
-      ) {
-        next.climMin = Number(declaredRange[0]);
-        next.climMax = Number(declaredRange[1]);
-      } else if (
-        /digital numbers?|quantification/i.test(String(rootAttrs.note ?? ""))
-      ) {
-        next.climMin = 0;
-        next.climMax = 1e4;
-      } else {
-        next.climMin = 0;
-        next.climMax = 1;
-      }
-      const interval = String(rootAttrs.time_step ?? "").match(
-        /^(\d+(?:\.\d+)?)\s*([DHMS])$/i
-      );
-      if (interval) {
-        next.timeStep = Number(interval[1]);
-        next.dateUnit = { D: "days", H: "hours", M: "minutes", S: "seconds" }[
-          interval[2].toUpperCase()
-        ];
-      } else {
-        next.timeStep = 1;
-      }
-      next.timeStart = 0;
-      next.timeValuesText = "";
-      const spatial =
-        metadata[`${next.xDimension}/.zattrs`] ??
-        metadata[`${next.yDimension}/.zattrs`] ??
-        {};
-      next.crs = spatial.crs ?? "";
-      if (
-        Array.isArray(rootAttrs.bbox_wgs84) &&
-        rootAttrs.bbox_wgs84.length === 4
-      )
-        next.mapBounds = rootAttrs.bbox_wgs84.join(", ");
-      const grid = metadata["spatial_ref/.zattrs"] ?? {};
-      const transform = String(grid.GeoTransform ?? "")
-        .trim()
-        .split(/\s+/)
-        .map(Number);
-      if (transform.length === 6 && transform.every(Number.isFinite)) {
-        const width = variable.array.shape[xIndex];
-        const height = variable.array.shape[yIndex];
-        if (Number.isFinite(width) && Number.isFinite(height)) {
-          const x2 = transform[0] + transform[1] * width;
-          const y2 = transform[3] + transform[5] * height;
-          next.sourceBounds = [
-            Math.min(transform[0], x2),
-            Math.min(transform[3], y2),
-            Math.max(transform[0], x2),
-            Math.max(transform[3], y2),
-          ].join(", ");
-        }
-      }
-    }
-  }
-  cfg = next;
-  values = [];
-  labels = [];
-  render();
-  const details = panel?.querySelector(".ztsv-config");
-  if (details) details.open = true;
-  status(
-    `Selected local store “${storeName}”. Review the detected settings, then add it.`,
-    "success"
+  const metadataFile = index.get(
+    metadataPath.endsWith(".zmetadata") ? ".zmetadata" : "zarr.json"
   );
+  if (!metadataFile)
+    throw new Error("The selected Zarr metadata file could not be read.");
+  const discovered = metadataFromDocument(
+    JSON.parse(await metadataFile.text())
+  );
+  applyInspectedMetadata(
+    discovered.metadata,
+    {
+      ...cfg,
+      source: "local",
+      url: storeName,
+      name: storeName,
+    },
+    discovered.zarrVersion
+  );
+  status("Reading the first acquisition to determine its display range…");
+  const range = await applyLocalDisplayRange();
+  if (range) {
+    status(
+      `Found ${cfg.availableVariables.length} data variable${
+        cfg.availableVariables.length === 1 ? "" : "s"
+      } and derived a display range of ${range[0].toLocaleString()} to ${range[1].toLocaleString()} from the first acquisition.`,
+      "success"
+    );
+  }
 }
 function currentValue() {
   const value = selectedSeries?.[frame];
@@ -595,6 +499,7 @@ function updateUi() {
   const count = panel.querySelector("[data-count]");
   const play2 = panel.querySelector("[data-play]");
   const acquisition = panel.querySelector("[data-acquisition]");
+  const acquisitionIndex = panel.querySelector("[data-acquisition-index]");
   const current = panel.querySelector("[data-current]");
   const cursor = panel.querySelector("[data-cursor]");
   if (range) {
@@ -604,6 +509,7 @@ function updateUi() {
   if (date) date.textContent = labels[frame] ?? String(values[frame]);
   if (count) count.textContent = `${frame + 1} / ${values.length}`;
   if (acquisition) acquisition.value = String(frame);
+  if (acquisitionIndex) acquisitionIndex.value = String(frame + 1);
   if (play2) {
     play2.textContent = timer ? "Pause" : "Play";
     play2.setAttribute("aria-pressed", timer ? "true" : "false");
@@ -776,7 +682,9 @@ function exportFileName(label) {
 
 function numericArray(value, keepMissing = false) {
   return Array.isArray(value) || ArrayBuffer.isView(value)
-    ? Array.from(value, Number).filter((item) => keepMissing || Number.isFinite(item))
+    ? Array.from(value, Number).filter(
+        (item) => keepMissing || Number.isFinite(item)
+      )
     : [];
 }
 
@@ -807,15 +715,15 @@ function queryResultToRaster(result) {
     Number.isInteger(cfg.gridWidth)
       ? cfg.gridWidth
       : bounds && inferredX
-        ? (bounds[2] - bounds[0]) / inferredX
-        : uniqueX.length,
+      ? (bounds[2] - bounds[0]) / inferredX
+      : uniqueX.length
   );
   const height = Math.round(
     Number.isInteger(cfg.gridHeight)
       ? cfg.gridHeight
       : bounds && inferredY
-        ? (bounds[3] - bounds[1]) / inferredY
-        : uniqueY.length,
+      ? (bounds[3] - bounds[1]) / inferredY
+      : uniqueY.length
   );
   const resX = bounds ? (bounds[2] - bounds[0]) / width : inferredX || 1;
   const resY = bounds ? (bounds[3] - bounds[1]) / height : inferredY || 1;
@@ -825,9 +733,17 @@ function queryResultToRaster(result) {
   const band = new Float32Array(width * height);
   band.fill(nodata);
   for (let index = 0; index < data.length; index += 1) {
-    const column = Math.min(width - 1, Math.max(0, Math.floor((x[index] - originX) / resX)));
-    const row = Math.min(height - 1, Math.max(0, Math.floor((originY - y[index]) / resY)));
-    band[row * width + column] = Number.isFinite(data[index]) ? data[index] : nodata;
+    const column = Math.min(
+      width - 1,
+      Math.max(0, Math.floor((x[index] - originX) / resX))
+    );
+    const row = Math.min(
+      height - 1,
+      Math.max(0, Math.floor((originY - y[index]) / resY))
+    );
+    band[row * width + column] = Number.isFinite(data[index])
+      ? data[index]
+      : nodata;
   }
   return { band, width, height, originX, originY, resX, resY, nodata };
 }
@@ -841,20 +757,32 @@ function overviewLevels(width, height) {
 
 async function rasterToCog(raster) {
   const wasmUrl = app.resolvePluginAssetUrl?.(ID, "geolibre_wasm_bg.wasm");
-  if (!wasmUrl) throw new Error("The plugin COG encoder could not be resolved.");
+  if (!wasmUrl)
+    throw new Error("The plugin COG encoder could not be resolved.");
   cogWasmReady ??= initCogWasm(wasmUrl).catch((error) => {
     cogWasmReady = null;
     throw error;
   });
   await cogWasmReady;
-  const epsg = Number(String(cfg.crs).toUpperCase().match(/^EPSG:(\d+)$/)?.[1]);
+  const epsg = Number(
+    String(cfg.crs)
+      .toUpperCase()
+      .match(/^EPSG:(\d+)$/)?.[1]
+  );
   if (!Number.isInteger(epsg) || epsg < 1 || epsg > 65535)
     throw new Error("COG export requires an EPSG CRS.");
   const builder = new CogBuilder(raster.width, raster.height, 1);
   try {
     builder.set_epsg(epsg);
     builder.set_geo_transform(
-      Float64Array.from([raster.originX, raster.resX, 0, raster.originY, 0, -raster.resY]),
+      Float64Array.from([
+        raster.originX,
+        raster.resX,
+        0,
+        raster.originY,
+        0,
+        -raster.resY,
+      ])
     );
     builder.set_nodata(raster.nodata);
     builder.set_tile_size(512);
@@ -871,7 +799,12 @@ async function saveCog(bytes, filename) {
   if (typeof window.showSaveFilePicker === "function") {
     const handle = await window.showSaveFilePicker({
       suggestedName: filename,
-      types: [{ description: "Cloud Optimized GeoTIFF", accept: { "image/tiff": [".tif"] } }],
+      types: [
+        {
+          description: "Cloud Optimized GeoTIFF",
+          accept: { "image/tiff": [".tif"] },
+        },
+      ],
     });
     const writable = await handle.createWritable();
     await writable.write(blob);
@@ -916,7 +849,7 @@ async function exportCurrentAcquisition() {
     const result = await activeLayer().queryData(
       geometry,
       { [cfg.timeDimension]: values[frame] },
-      { includeSpatialCoordinates: true, level: "finest" },
+      { includeSpatialCoordinates: true, level: "finest" }
     );
     const bytes = await rasterToCog(queryResultToRaster(result));
     await saveCog(bytes, exportFileName(label));
@@ -965,7 +898,9 @@ async function load(next = cfg) {
     const nextLayerId = await addNativeZarrLayer(
       cfg.name || `${cfg.variable} time series`,
       cfg,
-      cfg.source === "sample" ? { [cfg.timeDimension]: values[frame] } : undefined,
+      cfg.source === "sample"
+        ? { [cfg.timeDimension]: values[frame] }
+        : undefined
     );
     if (!app || !nativeLayers.has(nextLayerId)) {
       removeNativeLayer(nextLayerId);
@@ -1049,17 +984,16 @@ function formHtml() {
       value[0].toUpperCase() + value.slice(1)
     }</option>`;
   const availableVariables = cfg.availableVariables ?? [];
-  const variableControl =
-    availableVariables.length
-      ? `<select name="variable" required>${availableVariables
-          .map(
-            (name) =>
-              `<option value="${esc(name)}" ${
-                name === cfg.variable ? "selected" : ""
-              }>${esc(name)}</option>`
-          )
-          .join("")}</select>`
-      : `<input name="variable" value="${esc(cfg.variable)}" required/>`;
+  const variableControl = availableVariables.length
+    ? `<select name="variable" required>${availableVariables
+        .map(
+          (name) =>
+            `<option value="${esc(name)}" ${
+              name === cfg.variable ? "selected" : ""
+            }>${esc(name)}</option>`
+        )
+        .join("")}</select>`
+    : `<input name="variable" value="${esc(cfg.variable)}" required/>`;
   return `<details class="ztsv-config"><summary>Data source and display settings</summary><form data-form>
     <label>Source<select name="source"><option value="sample" ${
       cfg.source === "sample" ? "selected" : ""
@@ -1089,7 +1023,7 @@ function formHtml() {
     )}"/></label><label>Step<input name="timeStep" type="number" step="any" value="${esc(
     cfg.timeStep
   )}"/></label>
-    <label>Count<input name="timeCount" type="number" min="1" max="10000" value="${esc(
+    <label>Count<input name="timeCount" type="number" min="1" value="${esc(
       cfg.timeCount
     )}"/></label><label class="ztsv-wide">Explicit time values<textarea name="timeValuesText" rows="2" placeholder="Optional comma-separated coordinates">${esc(
     cfg.timeValuesText
@@ -1156,6 +1090,21 @@ function render() {
       return PALETTES.viridis;
     }
   })();
+  const acquisitionControl =
+    labels.length <= 2000
+      ? `<select data-acquisition>${labels
+          .map(
+            (label, index) =>
+              `<option value="${index}" ${
+                index === frame ? "selected" : ""
+              }>${esc(label)}</option>`
+          )
+          .join("")}</select>`
+      : `<input data-acquisition-index type="number" min="1" max="${
+          labels.length
+        }" value="${
+          frame + 1
+        }" aria-label="Acquisition number"/><small>Enter an acquisition number from 1 to ${labels.length.toLocaleString()}.</small>`;
   panel.classList.add("ztsv-panel");
   panel.innerHTML = `<section class="ztsv-hero"><div class="ztsv-eyebrow">Zarr data cube</div><h2>${esc(
     cfg.name
@@ -1165,16 +1114,7 @@ function render() {
         ? "Ready. Click the layer to chart a pixel."
         : "Preparing the dataset…"
     }</div>${formHtml()}
-    <section class="ztsv-card"><div class="ztsv-date-row"><strong data-date></strong><span data-count></span></div><label class="ztsv-speed">Acquisition<select data-acquisition>${labels
-      .map(
-        (label, index) =>
-          `<option value="${index}" ${index === frame ? "selected" : ""}>${esc(
-            label
-          )}</option>`
-      )
-      .join(
-        ""
-      )}</select></label><input data-range class="ztsv-range" type="range" min="0" max="${
+    <section class="ztsv-card"><div class="ztsv-date-row"><strong data-date></strong><span data-count></span></div><label class="ztsv-speed">Acquisition${acquisitionControl}</label><input data-range class="ztsv-range" type="range" min="0" max="${
     values.length - 1
   }" step="1" aria-label="Time step"/><div class="ztsv-controls"><button data-prev>Previous</button><button data-play aria-pressed="false">Play</button><button data-next>Next</button></div><button data-add-acquisition class="ztsv-secondary" ${
     layerId ? "" : "disabled"
@@ -1218,7 +1158,7 @@ function render() {
     ?.addEventListener("change", (event) => {
       if (event.currentTarget.value !== "custom") return;
       localStore = null;
-      remoteMetadata = null;
+      inspectedMetadata = null;
       const form = event.currentTarget.form;
       form.elements.url.value = "";
       form.elements.name.value = "Zarr time series";
@@ -1236,20 +1176,41 @@ function render() {
   const remoteUrlInput = panel.querySelector('[name="url"]');
   panel
     .querySelector("[data-inspect-url]")
-    ?.addEventListener("click", (event) =>
-      void inspectRemoteStore(event.currentTarget.form),
-    );
+    ?.addEventListener("click", (event) => {
+      const form = event.currentTarget.form;
+      if (form?.elements.source.value === "local") {
+        try {
+          inspectLocalStore(form);
+        } catch (error) {
+          status(
+            error instanceof Error
+              ? error.message
+              : "Could not inspect this local Zarr store.",
+            "error"
+          );
+        }
+        return;
+      }
+      void inspectRemoteStore(form);
+    });
   remoteUrlInput?.addEventListener("change", (event) => {
     const form = event.currentTarget.form;
-    if (form?.elements.source.value === "custom" && event.currentTarget.value.trim())
+    if (
+      form?.elements.source.value === "custom" &&
+      event.currentTarget.value.trim()
+    )
       void inspectRemoteStore(form);
   });
   panel
     .querySelector('[name="variable"]')
     ?.addEventListener("change", (event) => {
       const form = event.currentTarget.form;
-      if (!remoteMetadata || form?.elements.source.value !== "custom") return;
-      cfg = configFromMetadata(remoteMetadata, {
+      if (
+        !inspectedMetadata ||
+        !["custom", "local"].includes(form?.elements.source.value)
+      )
+        return;
+      cfg = configFromMetadata(inspectedMetadata, {
         ...readForm(form),
         variable: event.currentTarget.value,
       });
@@ -1257,9 +1218,29 @@ function render() {
       labels = [];
       render();
       panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+      if (form.elements.source.value === "local" && !cfg.hasDeclaredRange) {
+        status("Reading the first acquisition to determine its display range…");
+        void applyLocalDisplayRange()
+          .then((range) => {
+            if (!range) return;
+            status(
+              `${cfg.variable} selected with a derived display range of ${range[0].toLocaleString()} to ${range[1].toLocaleString()}.`,
+              "success"
+            );
+          })
+          .catch((error) =>
+            status(
+              error instanceof Error
+                ? error.message
+                : "Could not inspect this variable's display range.",
+              "error"
+            )
+          );
+        return;
+      }
       status(
         `${cfg.variable} selected. Review the display range, then add the time series.`,
-        "success",
+        "success"
       );
     });
   const folderInput = panel.querySelector("[data-folder-input]");
@@ -1283,6 +1264,13 @@ function render() {
     .querySelector("[data-acquisition]")
     ?.addEventListener("change", (event) => {
       const next = Number(event.currentTarget.value);
+      stop();
+      void show(next);
+    });
+  panel
+    .querySelector("[data-acquisition-index]")
+    ?.addEventListener("change", (event) => {
+      const next = Number(event.currentTarget.value) - 1;
       stop();
       void show(next);
     });
@@ -1390,7 +1378,7 @@ const plugin = {
     unregister = null;
     metadataController?.abort();
     metadataController = null;
-    remoteMetadata = null;
+    inspectedMetadata = null;
     bundledStore = null;
     app = null;
   },
@@ -1427,4 +1415,3 @@ const plugin = {
 };
 var stdin_default = plugin;
 export { stdin_default as default, plugin };
-

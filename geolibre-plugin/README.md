@@ -33,9 +33,12 @@ GeoLibre source change. It adds:
 
 Open **Data source and display settings** in the panel to configure another
 dataset. Use **Choose Zarr folder** for a directory on disk. Consolidated Zarr
-v2 metadata is used to prefill the variable, dimensions, time count, date units,
-CRS, bounds, color range, and available variables when present. A store nested
-inside a selected wrapper folder is detected automatically. For a remote URL,
-choose **Read metadata and variables** before adding the layer. Remote stores
-must permit browser CORS requests and expose consolidated metadata. The sample
-remains available as the **Bundled NDVI example** preset.
+v2 or v3 metadata prefills the variable, dimensions, time count, date units,
+CRS, bounds, color range, and available variables when present. When explicit
+bounds are absent, the viewer derives the full pixel-edge extent from the
+spatial coordinate arrays and uses it for both zoom controls. A store nested
+inside a selected wrapper folder is detected automatically. Use **Read metadata
+and variables** to refresh discovery for either a selected local folder or a
+remote URL. Remote stores must permit browser CORS requests and expose
+consolidated metadata. The sample remains available as the **Bundled NDVI
+example** preset.

@@ -43,6 +43,17 @@ function v3Metadata(document) {
   return metadata;
 }
 
+export function metadataFromDocument(document) {
+  if (document?.metadata && typeof document.metadata === "object") {
+    return { zarrVersion: 2, metadata: document.metadata };
+  }
+  const metadata = v3Metadata(document);
+  if (metadata) return { zarrVersion: 3, metadata };
+  throw new Error(
+    "No consolidated Zarr metadata was found. Expected .zmetadata (v2) or consolidated metadata in zarr.json (v3)."
+  );
+}
+
 async function fetchJson(fetchImpl, url, signal) {
   const response = await fetchImpl(url, { signal });
   if (response.status === 404) return null;
@@ -55,15 +66,50 @@ async function fetchJson(fetchImpl, url, signal) {
 export async function readRemoteMetadata(value, fetchImpl = fetch, signal) {
   const url = normalizeStoreUrl(value);
   const v2 = await fetchJson(fetchImpl, `${url}/.zmetadata`, signal);
-  if (v2?.metadata && typeof v2.metadata === "object") {
-    return { url, zarrVersion: 2, metadata: v2.metadata };
-  }
+  if (v2) return { url, ...metadataFromDocument(v2) };
   const v3 = await fetchJson(fetchImpl, `${url}/zarr.json`, signal);
-  const metadata = v3Metadata(v3);
-  if (metadata) return { url, zarrVersion: 3, metadata };
+  if (v3) return { url, ...metadataFromDocument(v3) };
   throw new Error(
-    "No consolidated Zarr metadata was found. Remote variable discovery requires .zmetadata (v2) or consolidated metadata in zarr.json (v3).",
+    "No consolidated Zarr metadata was found. Remote variable discovery requires .zmetadata (v2) or consolidated metadata in zarr.json (v3)."
   );
+}
+
+export function configFromLayerSpatialMetadata(layer, current = {}) {
+  const result = { ...current };
+  const spatial = layer?.xyLimits ? layer : layer?.zarrStore ?? layer;
+  const limits = spatial?.xyLimits;
+  const bounds = limits
+    ? [limits.xMin, limits.yMin, limits.xMax, limits.yMax]
+    : [];
+  if (
+    !String(result.sourceBounds ?? "").trim() &&
+    bounds.length === 4 &&
+    bounds.every(Number.isFinite)
+  ) {
+    result.sourceBounds = bounds.join(", ");
+  }
+  const crs = spatial?.crs ?? layer?.crs;
+  if (!String(result.crs ?? "").trim() && String(crs ?? "").trim()) {
+    result.crs = String(crs).trim();
+  }
+  return result;
+}
+
+export function finiteRange(values) {
+  let minimum = Infinity;
+  let maximum = -Infinity;
+  for (const value of values ?? []) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) continue;
+    if (number < minimum) minimum = number;
+    if (number > maximum) maximum = number;
+  }
+  if (minimum > maximum) return null;
+  if (minimum === maximum) {
+    const padding = Math.max(Math.abs(minimum) * 0.01, 0.5);
+    return [minimum - padding, maximum + padding];
+  }
+  return [minimum, maximum];
 }
 
 function multiscaleVariables(arrays, rootAttrs) {
@@ -83,14 +129,61 @@ function multiscaleVariables(arrays, rootAttrs) {
   return variables.length ? variables : arrays;
 }
 
+function gridMappingNames(metadata) {
+  return new Set(
+    Object.entries(metadata)
+      .filter(([key]) => key.endsWith("/.zattrs"))
+      .map(([, attributes]) => String(attributes?.grid_mapping ?? "").trim())
+      .filter(Boolean)
+      .map((value) => value.split(/[\s:]+/, 1)[0])
+  );
+}
+
+function epsgFromText(value) {
+  const text = String(value ?? "");
+  const direct = text.match(/EPSG\s*[:/]\s*(\d{4,6})/i);
+  if (direct) return `EPSG:${direct[1]}`;
+  const matches = [
+    ...text.matchAll(/(?:AUTHORITY|ID)\s*\[\s*["']EPSG["']\s*,\s*["']?(\d{4,6})/gi),
+  ];
+  return matches.length ? `EPSG:${matches.at(-1)[1]}` : "";
+}
+
+function metadataCrs(metadata, variableAttrs, rootAttrs) {
+  const mappingName = String(variableAttrs.grid_mapping ?? "")
+    .trim()
+    .split(/[\s:]+/, 1)[0];
+  const mappingAttrs = mappingName
+    ? metadata[`${mappingName}/.zattrs`] ?? {}
+    : {};
+  const candidates = [
+    variableAttrs.crs,
+    variableAttrs.crs_wkt,
+    variableAttrs.spatial_ref,
+    mappingAttrs.crs,
+    mappingAttrs.crs_wkt,
+    mappingAttrs.spatial_ref,
+    rootAttrs.crs,
+    rootAttrs.crs_wkt,
+    rootAttrs.spatial_ref,
+  ];
+  for (const candidate of candidates) {
+    const epsg = epsgFromText(candidate);
+    if (epsg) return epsg;
+  }
+  return "";
+}
+
 export function configFromMetadata(metadata, current = {}) {
   const rootAttrs = metadata[".zattrs"] ?? {};
+  const coordinateReferenceArrays = gridMappingNames(metadata);
   const arrays = Object.entries(metadata)
     .filter(
       ([key, value]) =>
         key.endsWith("/.zarray") &&
         Array.isArray(value?.shape) &&
-        value.shape.length >= 3,
+        value.shape.length >= 3 &&
+        !coordinateReferenceArrays.has(key.slice(0, -8))
     )
     .map(([key, array]) => ({
       name: key.slice(0, -8),
@@ -101,42 +194,51 @@ export function configFromMetadata(metadata, current = {}) {
   const selected =
     variables.find((item) => item.name === current.variable) ?? variables[0];
   if (!selected) {
-    throw new Error("The store contains no arrays with at least three dimensions.");
+    throw new Error(
+      "The store contains no time-series arrays. Expected a variable with at least three dimensions: a time or sequence axis plus two spatial axes."
+    );
   }
 
   const variableAttrs = metadata[`${selected.metadataName}/.zattrs`] ?? {};
   const dimensions = variableAttrs._ARRAY_DIMENSIONS ?? [];
   const xDimension =
     dimensions.find((name) =>
-      ["x", "lon", "longitude"].includes(String(name).toLowerCase()),
+      ["x", "lon", "longitude"].includes(String(name).toLowerCase())
     ) ?? "x";
   const yDimension =
     dimensions.find((name) =>
-      ["y", "lat", "latitude"].includes(String(name).toLowerCase()),
+      ["y", "lat", "latitude"].includes(String(name).toLowerCase())
     ) ?? "y";
   const timeDimension =
+    dimensions.find((name) => String(name).toLowerCase() === "time") ??
     dimensions.find(
-      (name) => !SPATIAL_DIMENSIONS.has(String(name).toLowerCase()),
-    ) ?? dimensions[0] ?? "time";
+      (name) => !SPATIAL_DIMENSIONS.has(String(name).toLowerCase())
+    ) ??
+    dimensions[0] ??
+    "time";
   const timeIndex = dimensions.indexOf(timeDimension);
   const xIndex = dimensions.indexOf(xDimension);
   const yIndex = dimensions.indexOf(yDimension);
   const coordinate =
-    metadata[`${selected.metadataName.slice(0, selected.metadataName.lastIndexOf("/") + 1)}${timeDimension}/.zattrs`] ??
+    metadata[
+      `${selected.metadataName.slice(
+        0,
+        selected.metadataName.lastIndexOf("/") + 1
+      )}${timeDimension}/.zattrs`
+    ] ??
     metadata[`${timeDimension}/.zattrs`] ??
     {};
   const units = String(coordinate.units ?? "").match(
-    /^(milliseconds|seconds|minutes|hours|days)\s+since\s+(.+)$/i,
+    /^(milliseconds|seconds|minutes|hours|days)\s+since\s+(.+)$/i
   );
   const declaredRange =
     variableAttrs.actual_range ??
     variableAttrs.valid_range ??
     rootAttrs.variable_ranges?.[selected.name];
   const latitudeLongitude = [xDimension, yDimension].every((name) =>
-    ["lon", "longitude", "lat", "latitude"].includes(
-      String(name).toLowerCase(),
-    ),
+    ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
+  const detectedCrs = metadataCrs(metadata, variableAttrs, rootAttrs);
 
   return {
     ...current,
@@ -145,8 +247,10 @@ export function configFromMetadata(metadata, current = {}) {
     valueLabel:
       variableAttrs.long_name ??
       variableAttrs.standard_name ??
-      current.valueLabel ??
-      "",
+      variableAttrs.units ??
+      (current.variable === selected.name && current.valueLabel
+        ? current.valueLabel
+        : selected.name),
     timeDimension,
     timeCount: selected.array.shape[timeIndex >= 0 ? timeIndex : 0] ?? 1,
     timeStart: 0,
@@ -163,12 +267,20 @@ export function configFromMetadata(metadata, current = {}) {
     nodata: Number.isFinite(Number(selected.array.fill_value))
       ? Number(selected.array.fill_value)
       : -9999,
+    hasDeclaredRange:
+      Array.isArray(declaredRange) &&
+      declaredRange.length >= 2 &&
+      declaredRange.every(Number.isFinite),
     palette: selected.name.toLowerCase() === "ndvi" ? "ndvi" : "viridis",
     ...(Array.isArray(declaredRange) &&
     declaredRange.length >= 2 &&
     declaredRange.every(Number.isFinite)
       ? { climMin: Number(declaredRange[0]), climMax: Number(declaredRange[1]) }
       : {}),
-    ...(latitudeLongitude && !current.crs ? { crs: "EPSG:4326" } : {}),
+    ...(!current.crs && detectedCrs
+      ? { crs: detectedCrs }
+      : latitudeLongitude && !current.crs
+      ? { crs: "EPSG:4326" }
+      : {}),
   };
 }

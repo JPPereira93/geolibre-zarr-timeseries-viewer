@@ -1,6 +1,6 @@
 {
   "name": "geolibre-zarr-timeseries-viewer",
-  "version": "0.7.0",
+  "version": "0.7.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,7 +11,8 @@
   "dependencies": {
     "@carbonplan/zarr-layer": "0.11.0",
     "geolibre-wasm": "1.5.8",
-    "proj4": "2.22.0"
+    "proj4": "2.22.0",
+    "zarrita": "0.7.5"
   },
   "devDependencies": {
     "esbuild": "0.28.2"
