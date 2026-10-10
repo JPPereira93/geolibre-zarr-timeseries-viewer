@@ -25350,6 +25350,12 @@ function storeForConfig(config) {
   if (config.source === "local") return localStore;
   return null;
 }
+function hasConfiguredSource(config = cfg) {
+  if (!String(config.variable ?? "").trim()) return false;
+  if (!String(config.timeDimension ?? "").trim()) return false;
+  if (config.source === "local") return Boolean(localStore);
+  return Boolean(String(config.url ?? "").trim());
+}
 function proj4Definition(config = cfg) {
   const explicit = String(config.proj4 ?? "").trim();
   if (explicit) return explicit;
@@ -26180,7 +26186,7 @@ function render() {
   panel.innerHTML = `<section class="ztsv-hero"><div class="ztsv-eyebrow">Zarr data cube</div><h2>${esc(
     cfg.name
   )}</h2><p>${esc(cfg.variable)} \xB7 ${values.length} time steps</p></section>
-    <div data-status class="ztsv-status">${layerId ? "Ready. Click the layer to chart a pixel." : "Preparing the dataset\u2026"}</div>${formHtml()}
+    <div data-status class="ztsv-status">${layerId ? "Ready. Click the layer to chart a pixel." : "Choose a local Zarr folder or enter a remote store URL."}</div>${formHtml()}
     <section class="ztsv-card"><div class="ztsv-date-row"><strong data-date></strong><span data-count></span></div><label class="ztsv-speed">Acquisition${acquisitionControl}</label><input data-range class="ztsv-range" type="range" min="0" max="${values.length - 1}" step="1" aria-label="Time step"/><div class="ztsv-controls"><button data-prev>Previous</button><button data-play aria-pressed="false">Play</button><button data-next>Next</button></div><button data-add-acquisition class="ztsv-secondary" ${layerId ? "" : "disabled"}>Add current acquisition as layer</button><button data-export-acquisition class="ztsv-secondary" ${layerId ? "" : "disabled"}>Export current acquisition as COG</button><label class="ztsv-speed">Playback speed<select data-speed><option value="1000">1\xD7</option><option value="500" selected>2\xD7</option><option value="250">4\xD7</option></select></label><div class="ztsv-legend"><span>${esc(
     cfg.climMin
   )}</span><i style="background:linear-gradient(90deg,${palette.join(
@@ -26346,7 +26352,7 @@ function render() {
 function renderPanel(container) {
   panel = container;
   render();
-  if (!layerId) void load();
+  if (!layerId && hasConfiguredSource()) void load();
   return () => {
     if (panel === container) panel = null;
   };
@@ -26387,7 +26393,7 @@ var plugin = {
     control = new ViewerControl();
     host.addMapControl(control, "top-right");
     host.openRightPanel?.(PANEL);
-    if (!host.registerRightPanel) void load();
+    if (!host.registerRightPanel && hasConfiguredSource()) void load();
     return true;
   },
   deactivate(host) {
@@ -26432,6 +26438,10 @@ var plugin = {
     selectedSeries = null;
     updateUi();
     const restoredPoint = selectedPoint;
+    if (!layerId && hasConfiguredSource()) {
+      void load(cfg);
+      return true;
+    }
     if (layerId)
       void show(frame).then(() => {
         if (restoredPoint) return inspect(...restoredPoint);

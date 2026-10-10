@@ -141,6 +141,13 @@ function storeForConfig(config) {
   return null;
 }
 
+function hasConfiguredSource(config = cfg) {
+  if (!String(config.variable ?? "").trim()) return false;
+  if (!String(config.timeDimension ?? "").trim()) return false;
+  if (config.source === "local") return Boolean(localStore);
+  return Boolean(String(config.url ?? "").trim());
+}
+
 function proj4Definition(config = cfg) {
   const explicit = String(config.proj4 ?? "").trim();
   if (explicit) return explicit;
@@ -1092,7 +1099,7 @@ function render() {
     <div data-status class="ztsv-status">${
       layerId
         ? "Ready. Click the layer to chart a pixel."
-        : "Preparing the dataset…"
+        : "Choose a local Zarr folder or enter a remote store URL."
     }</div>${formHtml()}
     <section class="ztsv-card"><div class="ztsv-date-row"><strong data-date></strong><span data-count></span></div><label class="ztsv-speed">Acquisition${acquisitionControl}</label><input data-range class="ztsv-range" type="range" min="0" max="${
     values.length - 1
@@ -1299,7 +1306,7 @@ function render() {
 function renderPanel(container) {
   panel = container;
   render();
-  if (!layerId) void load();
+  if (!layerId && hasConfiguredSource()) void load();
   return () => {
     if (panel === container) panel = null;
   };
@@ -1342,7 +1349,7 @@ const plugin = {
     control = new ViewerControl();
     host.addMapControl(control, "top-right");
     host.openRightPanel?.(PANEL);
-    if (!host.registerRightPanel) void load();
+    if (!host.registerRightPanel && hasConfiguredSource()) void load();
     return true;
   },
   deactivate(host) {
@@ -1390,6 +1397,10 @@ const plugin = {
     selectedSeries = null;
     updateUi();
     const restoredPoint = selectedPoint;
+    if (!layerId && hasConfiguredSource()) {
+      void load(cfg);
+      return true;
+    }
     if (layerId)
       void show(frame).then(() => {
         if (restoredPoint) return inspect(...restoredPoint);
