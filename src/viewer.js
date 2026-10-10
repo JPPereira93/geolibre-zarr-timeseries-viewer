@@ -13,7 +13,6 @@ import { axisLabels, timeAxis } from "./time-axis.js";
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
 const VERSION = "0.7.4";
-const MAX_AUTOMATIC_RANGE_VALUES = 1_000_000;
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -375,13 +374,6 @@ async function inspectLocalDisplayRange() {
     return { range: null, reason: "suggested", values: 0 };
   const root = await zarr.open(localStore, { kind: "group" });
   const array = await zarr.open(root.resolve(cfg.variable), { kind: "array" });
-  const chunkValues = array.chunks.reduce((total, size) => total * size, 1);
-  if (
-    !Number.isSafeInteger(chunkValues) ||
-    chunkValues > MAX_AUTOMATIC_RANGE_VALUES
-  ) {
-    return { range: null, reason: "large-chunk", values: chunkValues };
-  }
   const chunk = await array.getChunk(Array(array.shape.length).fill(0));
   return {
     range: finiteRange(chunk.data),
@@ -470,13 +462,6 @@ async function chooseFolder(fileList) {
       `Found ${cfg.availableVariables.length} data variable${
         cfg.availableVariables.length === 1 ? "" : "s"
       }. Using the standard NDVI display range of -1 to 1.`,
-      "success"
-    );
-  } else if (result.reason === "large-chunk") {
-    status(
-      `Found ${cfg.availableVariables.length} data variable${
-        cfg.availableVariables.length === 1 ? "" : "s"
-      }. Skipped the automatic value scan because one chunk contains ${result.values.toLocaleString()} values; review the display range before adding the time series.`,
       "success"
     );
   } else {
@@ -1216,8 +1201,6 @@ function render() {
               status(
                 result.reason === "suggested"
                   ? `${cfg.variable} selected with the standard NDVI display range of -1 to 1.`
-                  : result.reason === "large-chunk"
-                  ? `${cfg.variable} selected. Skipped the automatic value scan because one chunk contains ${result.values.toLocaleString()} values; review the display range before adding the time series.`
                   : `${cfg.variable} selected. Review the display range before adding the time series.`,
                 "success"
               );
