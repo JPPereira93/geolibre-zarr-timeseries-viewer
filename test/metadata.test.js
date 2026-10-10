@@ -210,6 +210,19 @@ test("derives a finite display range while ignoring missing values", () => {
   assert.deepEqual(finiteRange([10, 10]), [9.5, 10.5]);
 });
 
+test("uses the physical NDVI range without scanning a data chunk", () => {
+  const config = configFromMetadata(
+    {
+      "ndvi/.zarray": { shape: [728, 642, 823] },
+      "ndvi/.zattrs": { _ARRAY_DIMENSIONS: ["time", "y", "x"] },
+    },
+    {}
+  );
+  assert.equal(config.hasSuggestedRange, true);
+  assert.equal(config.palette, "ndvi");
+  assert.deepEqual([config.climMin, config.climMax], [-1, 1]);
+});
+
 test("builds time axes longer than ten thousand coordinates", () => {
   const axis = timeAxis({
     timeValuesText: "",

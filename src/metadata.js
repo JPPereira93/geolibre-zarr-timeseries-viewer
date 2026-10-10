@@ -235,6 +235,8 @@ export function configFromMetadata(metadata, current = {}) {
     variableAttrs.actual_range ??
     variableAttrs.valid_range ??
     rootAttrs.variable_ranges?.[selected.name];
+  const normalizedVariable = selected.name.toLowerCase().split("/").at(-1);
+  const suggestedRange = normalizedVariable === "ndvi" ? [-1, 1] : null;
   const latitudeLongitude = [xDimension, yDimension].every((name) =>
     ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
@@ -271,11 +273,14 @@ export function configFromMetadata(metadata, current = {}) {
       Array.isArray(declaredRange) &&
       declaredRange.length >= 2 &&
       declaredRange.every(Number.isFinite),
+    hasSuggestedRange: Boolean(suggestedRange),
     palette: selected.name.toLowerCase() === "ndvi" ? "ndvi" : "viridis",
     ...(Array.isArray(declaredRange) &&
     declaredRange.length >= 2 &&
     declaredRange.every(Number.isFinite)
       ? { climMin: Number(declaredRange[0]), climMax: Number(declaredRange[1]) }
+      : suggestedRange
+      ? { climMin: suggestedRange[0], climMax: suggestedRange[1] }
       : {}),
     ...(!current.crs && detectedCrs
       ? { crs: detectedCrs }

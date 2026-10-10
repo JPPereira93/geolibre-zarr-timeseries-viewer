@@ -25161,6 +25161,8 @@ function configFromMetadata(metadata, current = {}) {
     /^(milliseconds|seconds|minutes|hours|days)\s+since\s+(.+)$/i
   );
   const declaredRange = variableAttrs.actual_range ?? variableAttrs.valid_range ?? rootAttrs.variable_ranges?.[selected.name];
+  const normalizedVariable = selected.name.toLowerCase().split("/").at(-1);
+  const suggestedRange = normalizedVariable === "ndvi" ? [-1, 1] : null;
   const latitudeLongitude = [xDimension, yDimension].every(
     (name) => ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
@@ -25183,8 +25185,9 @@ function configFromMetadata(metadata, current = {}) {
     gridHeight: selected.array.shape[yIndex],
     nodata: Number.isFinite(Number(selected.array.fill_value)) ? Number(selected.array.fill_value) : -9999,
     hasDeclaredRange: Array.isArray(declaredRange) && declaredRange.length >= 2 && declaredRange.every(Number.isFinite),
+    hasSuggestedRange: Boolean(suggestedRange),
     palette: selected.name.toLowerCase() === "ndvi" ? "ndvi" : "viridis",
-    ...Array.isArray(declaredRange) && declaredRange.length >= 2 && declaredRange.every(Number.isFinite) ? { climMin: Number(declaredRange[0]), climMax: Number(declaredRange[1]) } : {},
+    ...Array.isArray(declaredRange) && declaredRange.length >= 2 && declaredRange.every(Number.isFinite) ? { climMin: Number(declaredRange[0]), climMax: Number(declaredRange[1]) } : suggestedRange ? { climMin: suggestedRange[0], climMax: suggestedRange[1] } : {},
     ...!current.crs && detectedCrs ? { crs: detectedCrs } : latitudeLongitude && !current.crs ? { crs: "EPSG:4326" } : {}
   };
 }
@@ -25230,7 +25233,8 @@ function timeAxis(config) {
 // src/viewer.js
 var ID = "zarr-timeseries-viewer";
 var PANEL = "zarr-timeseries-viewer-panel";
-var VERSION = "0.7.3";
+var VERSION = "0.7.4";
+var MAX_AUTOMATIC_RANGE_VALUES = 1e6;
 var PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -25549,19 +25553,32 @@ function inspectLocalStore(form) {
   );
 }
 async function inspectLocalDisplayRange() {
-  if (!localStore || cfg.hasDeclaredRange) return null;
+  if (!localStore)
+    return { range: null, reason: "unavailable", values: 0 };
+  if (cfg.hasDeclaredRange)
+    return { range: null, reason: "declared", values: 0 };
+  if (cfg.hasSuggestedRange)
+    return { range: null, reason: "suggested", values: 0 };
   const root2 = await open(localStore, { kind: "group" });
   const array = await open(root2.resolve(cfg.variable), { kind: "array" });
+  const chunkValues = array.chunks.reduce((total, size) => total * size, 1);
+  if (!Number.isSafeInteger(chunkValues) || chunkValues > MAX_AUTOMATIC_RANGE_VALUES) {
+    return { range: null, reason: "large-chunk", values: chunkValues };
+  }
   const chunk = await array.getChunk(Array(array.shape.length).fill(0));
-  return finiteRange(chunk.data);
+  return {
+    range: finiteRange(chunk.data),
+    reason: "sampled",
+    values: chunk.data.length
+  };
 }
 async function applyLocalDisplayRange() {
-  const range2 = await inspectLocalDisplayRange();
-  if (!range2) return null;
-  cfg = { ...cfg, climMin: range2[0], climMax: range2[1] };
+  const result = await inspectLocalDisplayRange();
+  if (!result.range) return result;
+  cfg = { ...cfg, climMin: result.range[0], climMax: result.range[1] };
   render();
   panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
-  return range2;
+  return result;
 }
 async function chooseFolder(fileList) {
   const files = [...fileList];
@@ -25612,10 +25629,25 @@ async function chooseFolder(fileList) {
     discovered.zarrVersion
   );
   status("Reading the first acquisition to determine its display range\u2026");
-  const range2 = await applyLocalDisplayRange();
-  if (range2) {
+  const result = await applyLocalDisplayRange();
+  if (result.range) {
     status(
-      `Found ${cfg.availableVariables.length} data variable${cfg.availableVariables.length === 1 ? "" : "s"} and derived a display range of ${range2[0].toLocaleString()} to ${range2[1].toLocaleString()} from the first acquisition.`,
+      `Found ${cfg.availableVariables.length} data variable${cfg.availableVariables.length === 1 ? "" : "s"} and derived a display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()} from a small sample chunk.`,
+      "success"
+    );
+  } else if (result.reason === "suggested") {
+    status(
+      `Found ${cfg.availableVariables.length} data variable${cfg.availableVariables.length === 1 ? "" : "s"}. Using the standard NDVI display range of -1 to 1.`,
+      "success"
+    );
+  } else if (result.reason === "large-chunk") {
+    status(
+      `Found ${cfg.availableVariables.length} data variable${cfg.availableVariables.length === 1 ? "" : "s"}. Skipped the automatic value scan because one chunk contains ${result.values.toLocaleString()} values; review the display range before adding the time series.`,
+      "success"
+    );
+  } else {
+    status(
+      `Found ${cfg.availableVariables.length} data variable${cfg.availableVariables.length === 1 ? "" : "s"}. Review the display range before adding the time series.`,
       "success"
     );
   }
@@ -26236,10 +26268,16 @@ function render() {
     panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
     if (form.elements.source.value === "local" && !cfg.hasDeclaredRange) {
       status("Reading the first acquisition to determine its display range\u2026");
-      void applyLocalDisplayRange().then((range2) => {
-        if (!range2) return;
+      void applyLocalDisplayRange().then((result) => {
+        if (!result.range) {
+          status(
+            result.reason === "suggested" ? `${cfg.variable} selected with the standard NDVI display range of -1 to 1.` : result.reason === "large-chunk" ? `${cfg.variable} selected. Skipped the automatic value scan because one chunk contains ${result.values.toLocaleString()} values; review the display range before adding the time series.` : `${cfg.variable} selected. Review the display range before adding the time series.`,
+            "success"
+          );
+          return;
+        }
         status(
-          `${cfg.variable} selected with a derived display range of ${range2[0].toLocaleString()} to ${range2[1].toLocaleString()}.`,
+          `${cfg.variable} selected with a derived display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()}.`,
           "success"
         );
       }).catch(

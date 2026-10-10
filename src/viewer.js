@@ -12,7 +12,8 @@ import { axisLabels, timeAxis } from "./time-axis.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.3";
+const VERSION = "0.7.4";
+const MAX_AUTOMATIC_RANGE_VALUES = 1_000_000;
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -366,19 +367,35 @@ function inspectLocalStore(form) {
   );
 }
 async function inspectLocalDisplayRange() {
-  if (!localStore || cfg.hasDeclaredRange) return null;
+  if (!localStore)
+    return { range: null, reason: "unavailable", values: 0 };
+  if (cfg.hasDeclaredRange)
+    return { range: null, reason: "declared", values: 0 };
+  if (cfg.hasSuggestedRange)
+    return { range: null, reason: "suggested", values: 0 };
   const root = await zarr.open(localStore, { kind: "group" });
   const array = await zarr.open(root.resolve(cfg.variable), { kind: "array" });
+  const chunkValues = array.chunks.reduce((total, size) => total * size, 1);
+  if (
+    !Number.isSafeInteger(chunkValues) ||
+    chunkValues > MAX_AUTOMATIC_RANGE_VALUES
+  ) {
+    return { range: null, reason: "large-chunk", values: chunkValues };
+  }
   const chunk = await array.getChunk(Array(array.shape.length).fill(0));
-  return finiteRange(chunk.data);
+  return {
+    range: finiteRange(chunk.data),
+    reason: "sampled",
+    values: chunk.data.length,
+  };
 }
 async function applyLocalDisplayRange() {
-  const range = await inspectLocalDisplayRange();
-  if (!range) return null;
-  cfg = { ...cfg, climMin: range[0], climMax: range[1] };
+  const result = await inspectLocalDisplayRange();
+  if (!result.range) return result;
+  cfg = { ...cfg, climMin: result.range[0], climMax: result.range[1] };
   render();
   panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
-  return range;
+  return result;
 }
 async function chooseFolder(fileList) {
   const files = [...fileList];
@@ -440,12 +457,33 @@ async function chooseFolder(fileList) {
     discovered.zarrVersion
   );
   status("Reading the first acquisition to determine its display range…");
-  const range = await applyLocalDisplayRange();
-  if (range) {
+  const result = await applyLocalDisplayRange();
+  if (result.range) {
     status(
       `Found ${cfg.availableVariables.length} data variable${
         cfg.availableVariables.length === 1 ? "" : "s"
-      } and derived a display range of ${range[0].toLocaleString()} to ${range[1].toLocaleString()} from the first acquisition.`,
+      } and derived a display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()} from a small sample chunk.`,
+      "success"
+    );
+  } else if (result.reason === "suggested") {
+    status(
+      `Found ${cfg.availableVariables.length} data variable${
+        cfg.availableVariables.length === 1 ? "" : "s"
+      }. Using the standard NDVI display range of -1 to 1.`,
+      "success"
+    );
+  } else if (result.reason === "large-chunk") {
+    status(
+      `Found ${cfg.availableVariables.length} data variable${
+        cfg.availableVariables.length === 1 ? "" : "s"
+      }. Skipped the automatic value scan because one chunk contains ${result.values.toLocaleString()} values; review the display range before adding the time series.`,
+      "success"
+    );
+  } else {
+    status(
+      `Found ${cfg.availableVariables.length} data variable${
+        cfg.availableVariables.length === 1 ? "" : "s"
+      }. Review the display range before adding the time series.`,
       "success"
     );
   }
@@ -1173,10 +1211,20 @@ function render() {
       if (form.elements.source.value === "local" && !cfg.hasDeclaredRange) {
         status("Reading the first acquisition to determine its display range…");
         void applyLocalDisplayRange()
-          .then((range) => {
-            if (!range) return;
+          .then((result) => {
+            if (!result.range) {
+              status(
+                result.reason === "suggested"
+                  ? `${cfg.variable} selected with the standard NDVI display range of -1 to 1.`
+                  : result.reason === "large-chunk"
+                  ? `${cfg.variable} selected. Skipped the automatic value scan because one chunk contains ${result.values.toLocaleString()} values; review the display range before adding the time series.`
+                  : `${cfg.variable} selected. Review the display range before adding the time series.`,
+                "success"
+              );
+              return;
+            }
             status(
-              `${cfg.variable} selected with a derived display range of ${range[0].toLocaleString()} to ${range[1].toLocaleString()}.`,
+              `${cfg.variable} selected with a derived display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()}.`,
               "success"
             );
           })
