@@ -25230,7 +25230,7 @@ function timeAxis(config) {
 // src/viewer.js
 var ID = "zarr-timeseries-viewer";
 var PANEL = "zarr-timeseries-viewer-panel";
-var VERSION = "0.7.2";
+var VERSION = "0.7.3";
 var PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -25255,34 +25255,34 @@ var PALETTES = {
   ],
   grayscale: ["#000000", "#ffffff"]
 };
-var SAMPLE = {
-  source: "sample",
+var DEFAULT_CONFIG = {
+  source: "custom",
   url: "",
-  name: "Sentinel-2 NDVI sample",
-  variable: "ndvi",
-  availableVariables: ["ndvi"],
-  valueLabel: "NDVI",
+  name: "Zarr time series",
+  variable: "",
+  availableVariables: [],
+  valueLabel: "",
   timeDimension: "time",
   timeValuesText: "",
   timeStart: 0,
-  timeStep: 5,
-  timeCount: 728,
-  dateOrigin: "2016-01-16T00:00:00Z",
+  timeStep: 1,
+  timeCount: 1,
+  dateOrigin: "",
   dateUnit: "days",
-  climMin: -0.2,
+  climMin: 0,
   climMax: 1,
-  palette: "ndvi",
+  palette: "viridis",
   customColors: "#7f3b08, #d73027, #fdae61, #ffffbf, #a6d96a, #1a9850, #006837",
   zarrVersion: 2,
-  crs: "EPSG:32651",
+  crs: "",
   proj4: "",
   xDimension: "x",
   yDimension: "y",
-  sourceBounds: "568930, 1367920, 569330, 1368230",
-  mapBounds: "123.634078, 12.373348, 123.637764, 12.376142",
-  gridVariable: "ndvi",
-  gridWidth: 40,
-  gridHeight: 31,
+  sourceBounds: "",
+  mapBounds: "",
+  gridVariable: void 0,
+  gridWidth: void 0,
+  gridHeight: void 0,
   nodata: -9999
 };
 var app = null;
@@ -25302,10 +25302,9 @@ var selectedSeries = null;
 var loading = false;
 var addingAcquisition = false;
 var exportingAcquisition = false;
-var cfg = { ...SAMPLE };
+var cfg = { ...DEFAULT_CONFIG };
 var localStore = null;
 var localStoreId = "";
-var bundledStore = null;
 var metadataController = null;
 var inspectedMetadata = null;
 var nativeLayers = /* @__PURE__ */ new Map();
@@ -25336,15 +25335,6 @@ function status(message, kind = "info") {
   }
 }
 function sourceUrl(config) {
-  if (config.source === "sample") {
-    const metadata = app.resolvePluginAssetUrl?.(
-      ID,
-      "data/ndvi_smoothed.zarr/.zmetadata"
-    );
-    if (!metadata)
-      throw new Error("The bundled example URL could not be resolved.");
-    return metadata;
-  }
   if (config.source === "local") {
     if (!localStore) throw new Error("Choose the Zarr folder again.");
     return `local-zarr:${encodeURIComponent(
@@ -25353,29 +25343,7 @@ function sourceUrl(config) {
   }
   return normalizeStoreUrl(config.url);
 }
-function sampleStore() {
-  if (bundledStore) return bundledStore;
-  bundledStore = {
-    async get(key2) {
-      const cleanKey = String(key2).replace(/^\/+/, "");
-      if (!cleanKey || cleanKey.split("/").some((part) => !part || part === "." || part === ".."))
-        return void 0;
-      const url = app.resolvePluginAssetUrl?.(
-        ID,
-        `data/ndvi_smoothed.zarr/${cleanKey}`
-      );
-      if (!url) return void 0;
-      const response = await fetch(url);
-      if (response.status === 404) return void 0;
-      if (!response.ok)
-        throw new Error(`Could not read bundled Zarr asset ${cleanKey}.`);
-      return new Uint8Array(await response.arrayBuffer());
-    }
-  };
-  return bundledStore;
-}
 function storeForConfig(config) {
-  if (config.source === "sample") return sampleStore();
   if (config.source === "local") return localStore;
   return null;
 }
@@ -26019,8 +25987,7 @@ async function load(next = cfg) {
     if (layerId) removeNativeLayer(layerId);
     const nextLayerId = await addNativeZarrLayer(
       cfg.name || `${cfg.variable} time series`,
-      cfg,
-      cfg.source === "sample" ? { [cfg.timeDimension]: values[frame] } : void 0
+      cfg
     );
     if (!app || !nativeLayers.has(nextLayerId)) {
       removeNativeLayer(nextLayerId);
@@ -26103,7 +26070,7 @@ function formHtml() {
     (name) => `<option value="${esc(name)}" ${name === cfg.variable ? "selected" : ""}>${esc(name)}</option>`
   ).join("")}</select>` : `<input name="variable" value="${esc(cfg.variable)}" required/>`;
   return `<details class="ztsv-config"><summary>Data source and display settings</summary><form data-form>
-    <label>Source<select name="source"><option value="sample" ${cfg.source === "sample" ? "selected" : ""}>Bundled NDVI example</option>${cfg.source === "local" ? '<option value="local" selected>Local folder</option>' : ""}${option("custom", cfg.source)}</select></label>
+    <label>Source<select name="source">${cfg.source === "local" ? '<option value="local" selected>Local folder</option>' : ""}${option("custom", cfg.source)}</select></label>
     <div class="ztsv-folder ztsv-wide"><button type="button" data-folder>Choose Zarr folder</button><input data-folder-input type="file" webkitdirectory directory multiple hidden/><span>${cfg.source === "local" ? esc(cfg.url) : "Select a directory containing .zmetadata or zarr.json"}</span></div>
     <label class="ztsv-wide">Zarr store URL<input name="url" value="${esc(
     cfg.url
@@ -26208,16 +26175,13 @@ function render() {
     cfg.crs || "From store"
   )}</dd></div><div><dt>Color range</dt><dd>${esc(cfg.climMin)} to ${esc(
     cfg.climMax
-  )}</dd></div><div><dt>Source</dt><dd>${cfg.source === "sample" ? "Bundled example" : esc(cfg.url)}</dd></div></dl><button data-zoom class="ztsv-secondary">Zoom to dataset</button></section>`;
+  )}</dd></div><div><dt>Source</dt><dd>${esc(
+    cfg.url
+  )}</dd></div></dl><button data-zoom class="ztsv-secondary">Zoom to dataset</button></section>`;
   panel.querySelector("[data-form]")?.addEventListener("submit", (event) => {
     event.preventDefault();
     stop();
-    const next = readForm(event.currentTarget);
-    if (next.source === "sample") {
-      Object.assign(next, SAMPLE);
-      localStore = null;
-    }
-    void load(next);
+    void load(readForm(event.currentTarget));
   });
   panel.querySelector('[name="source"]')?.addEventListener("change", (event) => {
     if (event.currentTarget.value !== "custom") return;
@@ -26415,7 +26379,6 @@ var plugin = {
     metadataController?.abort();
     metadataController = null;
     inspectedMetadata = null;
-    bundledStore = null;
     app = null;
   },
   getProjectState() {
@@ -26423,8 +26386,10 @@ var plugin = {
   },
   applyProjectState(_host, state) {
     if (!state || typeof state !== "object") return false;
-    if (state.config && typeof state.config === "object")
-      cfg = { ...SAMPLE, ...state.config };
+    if (state.config && typeof state.config === "object") {
+      cfg = { ...DEFAULT_CONFIG, ...state.config };
+      if (cfg.source === "sample") cfg = { ...DEFAULT_CONFIG };
+    }
     try {
       const axis = timeAxis(cfg);
       values = axis.values;

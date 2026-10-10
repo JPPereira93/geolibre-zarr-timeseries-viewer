@@ -1,8 +1,7 @@
 # Zarr Time Series Viewer
 
-A configurable GeoLibre plugin for exploring gridded Zarr time series. The
-bundled Sentinel-2 NDVI dataset is now an example preset rather than a fixed
-part of the viewer.
+A configurable GeoLibre plugin for exploring gridded Zarr time series from a
+local folder or a remote store URL.
 
 The viewer bundles its own Zarr renderer and COG encoder. It only uses the
 public plugin APIs available in GeoLibre 3.3.0, so it does not require a
@@ -23,10 +22,6 @@ GeoLibre source change. It adds:
 
 ## Screenshots
 
-### Bundled NDVI example
-
-![Zarr Time Series Viewer showing the bundled NDVI example](screenshots/ndvi-viewer.png)
-
 ### Generic Zarr time series
 
 ![Zarr Time Series Viewer showing a non-NDVI NIR time series](screenshots/generic-zarr-viewer.png)
@@ -40,5 +35,4 @@ spatial coordinate arrays and uses it for both zoom controls. A store nested
 inside a selected wrapper folder is detected automatically. Use **Read metadata
 and variables** to refresh discovery for either a selected local folder or a
 remote URL. Remote stores must permit browser CORS requests and expose
-consolidated metadata. The sample remains available as the **Bundled NDVI
-example** preset.
+consolidated metadata.
