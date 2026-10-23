@@ -12,7 +12,7 @@ import { axisLabels, timeAxis } from "./time-axis.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.4";
+const VERSION = "0.7.5";
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -924,7 +924,11 @@ async function load(next = cfg) {
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") return;
     status(
-      error instanceof Error ? error.message : "Could not load the Zarr data.",
+      error instanceof Error
+        ? error.message
+        : typeof error === "string" && error
+        ? error
+        : "Could not load the Zarr data.",
       "error"
     );
   } finally {

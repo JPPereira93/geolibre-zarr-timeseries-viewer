@@ -174,6 +174,29 @@ function metadataCrs(metadata, variableAttrs, rootAttrs) {
   return "";
 }
 
+function metadataProjectionDefinition(metadata, variableAttrs, rootAttrs) {
+  const mappingName = String(variableAttrs.grid_mapping ?? "")
+    .trim()
+    .split(/[\s:]+/, 1)[0];
+  const mappingAttrs = mappingName
+    ? metadata[`${mappingName}/.zattrs`] ?? {}
+    : {};
+  const candidates = [
+    variableAttrs.crs_wkt,
+    variableAttrs.spatial_ref,
+    mappingAttrs.crs_wkt,
+    mappingAttrs.spatial_ref,
+    rootAttrs.crs_wkt,
+    rootAttrs.spatial_ref,
+  ];
+  return (
+    candidates.find(
+      (candidate) =>
+        typeof candidate === "string" && candidate.trim().length > 0
+    )?.trim() ?? ""
+  );
+}
+
 export function configFromMetadata(metadata, current = {}) {
   const rootAttrs = metadata[".zattrs"] ?? {};
   const coordinateReferenceArrays = gridMappingNames(metadata);
@@ -241,6 +264,11 @@ export function configFromMetadata(metadata, current = {}) {
     ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
   const detectedCrs = metadataCrs(metadata, variableAttrs, rootAttrs);
+  const detectedProjection = metadataProjectionDefinition(
+    metadata,
+    variableAttrs,
+    rootAttrs
+  );
 
   return {
     ...current,
@@ -286,6 +314,9 @@ export function configFromMetadata(metadata, current = {}) {
       ? { crs: detectedCrs }
       : latitudeLongitude && !current.crs
       ? { crs: "EPSG:4326" }
+      : {}),
+    ...(!current.proj4 && detectedProjection
+      ? { proj4: detectedProjection }
       : {}),
   };
 }

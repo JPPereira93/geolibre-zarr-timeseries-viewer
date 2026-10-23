@@ -171,6 +171,28 @@ test("detects a projected CRS and excludes its grid-mapping array", () => {
   assert.equal(config.gridHeight, 1908);
 });
 
+test("keeps a projected store's WKT definition for bounds conversion", () => {
+  const wkt =
+    'PROJCS["ETRS89-extended / LAEA Europe",GEOGCS["ETRS89",DATUM["European Terrestrial Reference System 1989",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Lambert_Azimuthal_Equal_Area"],PARAMETER["latitude_of_center",52],PARAMETER["longitude_of_center",10],PARAMETER["false_easting",4321000],PARAMETER["false_northing",3210000],UNIT["metre",1],AUTHORITY["EPSG","3035"]]';
+  const config = configFromMetadata(
+    {
+      "retention/.zarray": { shape: [13, 2243, 2178] },
+      "retention/.zattrs": {
+        _ARRAY_DIMENSIONS: ["period", "y", "x"],
+        grid_mapping: "spatial_ref",
+      },
+      "spatial_ref/.zarray": { shape: [] },
+      "spatial_ref/.zattrs": { crs_wkt: wkt },
+    },
+    {}
+  );
+
+  assert.equal(config.crs, "EPSG:3035");
+  assert.equal(config.proj4, wkt);
+  assert.equal(config.timeDimension, "period");
+  assert.equal(config.timeCount, 13);
+});
+
 test("copies renderer-derived coordinate bounds into plugin configuration", () => {
   const config = configFromLayerSpatialMetadata(
     {

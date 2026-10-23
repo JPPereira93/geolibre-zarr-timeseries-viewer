@@ -25122,6 +25122,21 @@ function metadataCrs(metadata, variableAttrs, rootAttrs) {
   }
   return "";
 }
+function metadataProjectionDefinition(metadata, variableAttrs, rootAttrs) {
+  const mappingName = String(variableAttrs.grid_mapping ?? "").trim().split(/[\s:]+/, 1)[0];
+  const mappingAttrs = mappingName ? metadata[`${mappingName}/.zattrs`] ?? {} : {};
+  const candidates = [
+    variableAttrs.crs_wkt,
+    variableAttrs.spatial_ref,
+    mappingAttrs.crs_wkt,
+    mappingAttrs.spatial_ref,
+    rootAttrs.crs_wkt,
+    rootAttrs.spatial_ref
+  ];
+  return candidates.find(
+    (candidate) => typeof candidate === "string" && candidate.trim().length > 0
+  )?.trim() ?? "";
+}
 function configFromMetadata(metadata, current = {}) {
   const rootAttrs = metadata[".zattrs"] ?? {};
   const coordinateReferenceArrays = gridMappingNames(metadata);
@@ -25167,6 +25182,11 @@ function configFromMetadata(metadata, current = {}) {
     (name) => ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
   const detectedCrs = metadataCrs(metadata, variableAttrs, rootAttrs);
+  const detectedProjection = metadataProjectionDefinition(
+    metadata,
+    variableAttrs,
+    rootAttrs
+  );
   return {
     ...current,
     variable: selected.name,
@@ -25188,7 +25208,8 @@ function configFromMetadata(metadata, current = {}) {
     hasSuggestedRange: Boolean(suggestedRange),
     palette: selected.name.toLowerCase() === "ndvi" ? "ndvi" : "viridis",
     ...Array.isArray(declaredRange) && declaredRange.length >= 2 && declaredRange.every(Number.isFinite) ? { climMin: Number(declaredRange[0]), climMax: Number(declaredRange[1]) } : suggestedRange ? { climMin: suggestedRange[0], climMax: suggestedRange[1] } : {},
-    ...!current.crs && detectedCrs ? { crs: detectedCrs } : latitudeLongitude && !current.crs ? { crs: "EPSG:4326" } : {}
+    ...!current.crs && detectedCrs ? { crs: detectedCrs } : latitudeLongitude && !current.crs ? { crs: "EPSG:4326" } : {},
+    ...!current.proj4 && detectedProjection ? { proj4: detectedProjection } : {}
   };
 }
 
@@ -25233,7 +25254,7 @@ function timeAxis(config) {
 // src/viewer.js
 var ID = "zarr-timeseries-viewer";
 var PANEL = "zarr-timeseries-viewer-panel";
-var VERSION = "0.7.4";
+var VERSION = "0.7.5";
 var PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -26049,7 +26070,7 @@ async function load(next = cfg) {
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") return;
     status(
-      error instanceof Error ? error.message : "Could not load the Zarr data.",
+      error instanceof Error ? error.message : typeof error === "string" && error ? error : "Could not load the Zarr data.",
       "error"
     );
   } finally {
