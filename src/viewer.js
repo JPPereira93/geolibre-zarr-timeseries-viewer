@@ -12,7 +12,7 @@ import { axisLabels, timeAxis } from "./time-axis.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.5";
+const VERSION = "0.7.6";
 const PALETTES = {
   ndvi: [
     "#7f3b08",

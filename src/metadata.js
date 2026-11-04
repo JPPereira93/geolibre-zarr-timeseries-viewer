@@ -140,8 +140,15 @@ function gridMappingNames(metadata) {
 }
 
 function epsgFromText(value) {
+  if (
+    Number.isInteger(value) &&
+    String(value).length >= 4 &&
+    String(value).length <= 6
+  ) {
+    return `EPSG:${value}`;
+  }
   const text = String(value ?? "");
-  const direct = text.match(/EPSG\s*[:/]\s*(\d{4,6})/i);
+  const direct = text.match(/EPSG(?:\s*[:/]\s*|::)(\d{4,6})/i);
   if (direct) return `EPSG:${direct[1]}`;
   const matches = [
     ...text.matchAll(/(?:AUTHORITY|ID)\s*\[\s*["']EPSG["']\s*,\s*["']?(\d{4,6})/gi),
@@ -149,21 +156,80 @@ function epsgFromText(value) {
   return matches.length ? `EPSG:${matches.at(-1)[1]}` : "";
 }
 
-function metadataCrs(metadata, variableAttrs, rootAttrs) {
+function referencedAttributes(metadata, variableName, reference) {
+  const cleanReference = String(reference ?? "")
+    .trim()
+    .replace(/^\/+|\/+$/g, "");
+  if (!cleanReference) return null;
+  const slash = variableName.lastIndexOf("/");
+  const prefix = slash >= 0 ? variableName.slice(0, slash + 1) : "";
+  const paths = cleanReference.includes("/")
+    ? [cleanReference]
+    : [`${prefix}${cleanReference}`, cleanReference];
+  for (const path of new Set(paths)) {
+    const attributes = metadata[`${path}/.zattrs`];
+    if (attributes && typeof attributes === "object") return attributes;
+  }
+  return null;
+}
+
+function spatialMetadataAttributes(
+  metadata,
+  variableName,
+  variableAttrs,
+  xDimension,
+  yDimension
+) {
   const mappingName = String(variableAttrs.grid_mapping ?? "")
     .trim()
     .split(/[\s:]+/, 1)[0];
-  const mappingAttrs = mappingName
-    ? metadata[`${mappingName}/.zattrs`] ?? {}
-    : {};
+  const coordinateNames = String(variableAttrs.coordinates ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const references = [
+    mappingName,
+    ...coordinateNames,
+    xDimension,
+    yDimension,
+  ].filter(Boolean);
+  const attributes = references
+    .map((reference) => referencedAttributes(metadata, variableName, reference))
+    .filter(Boolean);
+  return [...new Set(attributes)];
+}
+
+function metadataCrs(
+  metadata,
+  variableName,
+  variableAttrs,
+  rootAttrs,
+  xDimension,
+  yDimension
+) {
+  const spatialAttrs = spatialMetadataAttributes(
+    metadata,
+    variableName,
+    variableAttrs,
+    xDimension,
+    yDimension
+  );
   const candidates = [
     variableAttrs.crs,
+    variableAttrs.epsg,
+    variableAttrs.epsg_code,
     variableAttrs.crs_wkt,
     variableAttrs.spatial_ref,
-    mappingAttrs.crs,
-    mappingAttrs.crs_wkt,
-    mappingAttrs.spatial_ref,
+    ...spatialAttrs.flatMap((attributes) => [
+      attributes.crs,
+      attributes.epsg,
+      attributes.epsg_code,
+      attributes.crs_wkt,
+      attributes.spatial_ref,
+    ]),
     rootAttrs.crs,
+    rootAttrs.epsg,
+    rootAttrs.epsg_code,
     rootAttrs.crs_wkt,
     rootAttrs.spatial_ref,
   ];
@@ -174,18 +240,28 @@ function metadataCrs(metadata, variableAttrs, rootAttrs) {
   return "";
 }
 
-function metadataProjectionDefinition(metadata, variableAttrs, rootAttrs) {
-  const mappingName = String(variableAttrs.grid_mapping ?? "")
-    .trim()
-    .split(/[\s:]+/, 1)[0];
-  const mappingAttrs = mappingName
-    ? metadata[`${mappingName}/.zattrs`] ?? {}
-    : {};
+function metadataProjectionDefinition(
+  metadata,
+  variableName,
+  variableAttrs,
+  rootAttrs,
+  xDimension,
+  yDimension
+) {
+  const spatialAttrs = spatialMetadataAttributes(
+    metadata,
+    variableName,
+    variableAttrs,
+    xDimension,
+    yDimension
+  );
   const candidates = [
     variableAttrs.crs_wkt,
     variableAttrs.spatial_ref,
-    mappingAttrs.crs_wkt,
-    mappingAttrs.spatial_ref,
+    ...spatialAttrs.flatMap((attributes) => [
+      attributes.crs_wkt,
+      attributes.spatial_ref,
+    ]),
     rootAttrs.crs_wkt,
     rootAttrs.spatial_ref,
   ];
@@ -263,11 +339,21 @@ export function configFromMetadata(metadata, current = {}) {
   const latitudeLongitude = [xDimension, yDimension].every((name) =>
     ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
-  const detectedCrs = metadataCrs(metadata, variableAttrs, rootAttrs);
+  const detectedCrs = metadataCrs(
+    metadata,
+    selected.metadataName,
+    variableAttrs,
+    rootAttrs,
+    xDimension,
+    yDimension
+  );
   const detectedProjection = metadataProjectionDefinition(
     metadata,
+    selected.metadataName,
     variableAttrs,
-    rootAttrs
+    rootAttrs,
+    xDimension,
+    yDimension
   );
 
   return {

@@ -193,6 +193,49 @@ test("keeps a projected store's WKT definition for bounds conversion", () => {
   assert.equal(config.timeCount, 13);
 });
 
+test("detects a CRS coordinate referenced through the coordinates attribute", () => {
+  const wkt =
+    'PROJCRS["WGS 84 / UTM zone 51N",BASEGEOGCRS["WGS 84",ID["EPSG",4326]],ID["EPSG",32651]]';
+  const config = configFromMetadata(
+    {
+      "ndvi/.zarray": { shape: [731, 642, 823] },
+      "ndvi/.zattrs": {
+        _ARRAY_DIMENSIONS: ["time", "y", "x"],
+        coordinates: "spatial_ref",
+      },
+      "spatial_ref/.zarray": { shape: [] },
+      "spatial_ref/.zattrs": { crs_wkt: wkt, spatial_ref: wkt },
+      "x/.zarray": { shape: [823] },
+      "x/.zattrs": { _ARRAY_DIMENSIONS: ["x"], units: "metre" },
+      "y/.zarray": { shape: [642] },
+      "y/.zattrs": { _ARRAY_DIMENSIONS: ["y"], units: "metre" },
+    },
+    {}
+  );
+
+  assert.equal(config.crs, "EPSG:32651");
+  assert.equal(config.proj4, wkt);
+});
+
+test("falls back to CRS metadata declared by projected spatial axes", () => {
+  const config = configFromMetadata(
+    {
+      "temperature/.zarray": { shape: [12, 20, 30] },
+      "temperature/.zattrs": {
+        _ARRAY_DIMENSIONS: ["time", "y", "x"],
+      },
+      "x/.zarray": { shape: [30] },
+      "x/.zattrs": { _ARRAY_DIMENSIONS: ["x"], crs: "EPSG:32633" },
+      "y/.zarray": { shape: [20] },
+      "y/.zattrs": { _ARRAY_DIMENSIONS: ["y"], epsg: 32633 },
+    },
+    {}
+  );
+
+  assert.equal(config.crs, "EPSG:32633");
+  assert.equal(config.proj4, undefined);
+});
+
 test("copies renderer-derived coordinate bounds into plugin configuration", () => {
   const config = configFromLayerSpatialMetadata(
     {
