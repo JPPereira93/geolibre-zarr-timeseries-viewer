@@ -12,12 +12,16 @@ GeoLibre source change. It adds:
 - CRS, spatial dimensions, source bounds, and WGS84 map extents;
 - variable discovery for local and consolidated remote stores, plus direct
   acquisition selection;
+- keeping selected variables as separate reusable entries in GeoLibre's Layers
+  panel;
 - adding the current acquisition as a separate map layer for comparison;
 - exporting the current acquisition at full resolution as a tiled, overviewed
   Cloud Optimized GeoTIFF, deriving its WGS84 footprint from projected source
   bounds when map bounds are not supplied;
 - NDVI, Viridis, Plasma, Blues, Turbo, grayscale, and custom color palettes;
-- animated playback and click-to-chart pixel histories; and
+- animated playback and click-to-chart pixel histories;
+- exporting the selected pixel history as a labelled PNG plot with its Y-axis
+  clipped to the 2nd–98th percentile range; and
 - project-state persistence for viewer settings.
 
 ## Screenshots

@@ -5,6 +5,7 @@ import {
   configFromLayerSpatialMetadata,
   configFromMetadata,
   finiteRange,
+  hasResolvableCrs,
   metadataFromDocument,
   normalizeStoreUrl,
   readRemoteMetadata,
@@ -269,10 +270,58 @@ test("copies bounds from the renderer's internal Zarr store", () => {
   assert.equal(config.sourceBounds, "1, 2, 3, 4");
 });
 
+test("requires a CRS for generic projected spatial dimensions", () => {
+  assert.equal(hasResolvableCrs({ xDimension: "x", yDimension: "y" }), false);
+  assert.equal(
+    hasResolvableCrs({ xDimension: "x", yDimension: "y", crs: "EPSG:32651" }),
+    true
+  );
+  assert.equal(
+    hasResolvableCrs({ xDimension: "longitude", yDimension: "latitude" }),
+    true
+  );
+});
+
 test("derives a finite display range while ignoring missing values", () => {
   assert.deepEqual(finiteRange([Number.NaN, 24.75, 52.91, Infinity]), [24.75, 52.91]);
   assert.equal(finiteRange([Number.NaN, Infinity]), null);
   assert.deepEqual(finiteRange([10, 10]), [9.5, 10.5]);
+});
+
+test("derives physical ranges from packed values and excludes fill values", () => {
+  assert.deepEqual(
+    finiteRange([-32768, -10_000, 5_000], {
+      fillValue: -32768,
+      scaleFactor: 0.0001,
+    }),
+    [-1, 0.5]
+  );
+  assert.deepEqual(
+    finiteRange([0, 10], { scaleFactor: 0.5, addOffset: -2 }),
+    [-2, 3]
+  );
+});
+
+test("discovers packed-value transforms for each variable", () => {
+  const metadata = {
+    "evi/.zarray": { shape: [728, 642, 823], fill_value: -32768 },
+    "evi/.zattrs": {
+      _ARRAY_DIMENSIONS: ["time", "y", "x"],
+      scale_factor: 0.0001,
+    },
+    "mvi/.zarray": { shape: [728, 642, 823], fill_value: -32768 },
+    "mvi/.zattrs": {
+      _ARRAY_DIMENSIONS: ["time", "y", "x"],
+      scale_factor: 0.001,
+    },
+  };
+
+  const evi = configFromMetadata(metadata, { variable: "evi" });
+  const mvi = configFromMetadata(metadata, { variable: "mvi" });
+  assert.equal(evi.scaleFactor, 0.0001);
+  assert.equal(evi.addOffset, 0);
+  assert.equal(evi.nodata, -32768);
+  assert.equal(mvi.scaleFactor, 0.001);
 });
 
 test("uses the physical NDVI range without scanning a data chunk", () => {

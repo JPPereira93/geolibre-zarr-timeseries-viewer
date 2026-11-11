@@ -95,14 +95,35 @@ export function configFromLayerSpatialMetadata(layer, current = {}) {
   return result;
 }
 
-export function finiteRange(values) {
+export function hasResolvableCrs(config = {}) {
+  if (String(config.crs ?? "").trim() || String(config.proj4 ?? "").trim())
+    return true;
+  const x = String(config.xDimension ?? "").toLowerCase();
+  const y = String(config.yDimension ?? "").toLowerCase();
+  return ["lon", "longitude"].includes(x) && ["lat", "latitude"].includes(y);
+}
+
+export function finiteRange(
+  values,
+  { fillValue, scaleFactor = 1, addOffset = 0 } = {}
+) {
+  const numericFillValue = Number(fillValue);
+  const hasFillValue =
+    fillValue !== undefined &&
+    fillValue !== null &&
+    Number.isFinite(numericFillValue);
+  const scale = Number.isFinite(Number(scaleFactor)) ? Number(scaleFactor) : 1;
+  const offset = Number.isFinite(Number(addOffset)) ? Number(addOffset) : 0;
   let minimum = Infinity;
   let maximum = -Infinity;
   for (const value of values ?? []) {
     const number = Number(value);
     if (!Number.isFinite(number)) continue;
-    if (number < minimum) minimum = number;
-    if (number > maximum) maximum = number;
+    if (hasFillValue && number === numericFillValue) continue;
+    const physical = number * scale + offset;
+    if (!Number.isFinite(physical)) continue;
+    if (physical < minimum) minimum = physical;
+    if (physical > maximum) maximum = physical;
   }
   if (minimum > maximum) return null;
   if (minimum === maximum) {
@@ -336,6 +357,8 @@ export function configFromMetadata(metadata, current = {}) {
     rootAttrs.variable_ranges?.[selected.name];
   const normalizedVariable = selected.name.toLowerCase().split("/").at(-1);
   const suggestedRange = normalizedVariable === "ndvi" ? [-1, 1] : null;
+  const scaleFactor = Number(variableAttrs.scale_factor);
+  const addOffset = Number(variableAttrs.add_offset);
   const latitudeLongitude = [xDimension, yDimension].every((name) =>
     ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
@@ -383,6 +406,8 @@ export function configFromMetadata(metadata, current = {}) {
     nodata: Number.isFinite(Number(selected.array.fill_value))
       ? Number(selected.array.fill_value)
       : -9999,
+    scaleFactor: Number.isFinite(scaleFactor) ? scaleFactor : 1,
+    addOffset: Number.isFinite(addOffset) ? addOffset : 0,
     hasDeclaredRange:
       Array.isArray(declaredRange) &&
       declaredRange.length >= 2 &&

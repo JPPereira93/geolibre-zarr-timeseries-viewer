@@ -25060,14 +25060,28 @@ function configFromLayerSpatialMetadata(layer, current = {}) {
   }
   return result;
 }
-function finiteRange(values2) {
+function hasResolvableCrs(config = {}) {
+  if (String(config.crs ?? "").trim() || String(config.proj4 ?? "").trim())
+    return true;
+  const x = String(config.xDimension ?? "").toLowerCase();
+  const y = String(config.yDimension ?? "").toLowerCase();
+  return ["lon", "longitude"].includes(x) && ["lat", "latitude"].includes(y);
+}
+function finiteRange(values2, { fillValue, scaleFactor = 1, addOffset = 0 } = {}) {
+  const numericFillValue = Number(fillValue);
+  const hasFillValue = fillValue !== void 0 && fillValue !== null && Number.isFinite(numericFillValue);
+  const scale2 = Number.isFinite(Number(scaleFactor)) ? Number(scaleFactor) : 1;
+  const offset = Number.isFinite(Number(addOffset)) ? Number(addOffset) : 0;
   let minimum = Infinity;
   let maximum = -Infinity;
   for (const value of values2 ?? []) {
     const number = Number(value);
     if (!Number.isFinite(number)) continue;
-    if (number < minimum) minimum = number;
-    if (number > maximum) maximum = number;
+    if (hasFillValue && number === numericFillValue) continue;
+    const physical = number * scale2 + offset;
+    if (!Number.isFinite(physical)) continue;
+    if (physical < minimum) minimum = physical;
+    if (physical > maximum) maximum = physical;
   }
   if (minimum > maximum) return null;
   if (minimum === maximum) {
@@ -25225,6 +25239,8 @@ function configFromMetadata(metadata, current = {}) {
   const declaredRange = variableAttrs.actual_range ?? variableAttrs.valid_range ?? rootAttrs.variable_ranges?.[selected.name];
   const normalizedVariable = selected.name.toLowerCase().split("/").at(-1);
   const suggestedRange = normalizedVariable === "ndvi" ? [-1, 1] : null;
+  const scaleFactor = Number(variableAttrs.scale_factor);
+  const addOffset = Number(variableAttrs.add_offset);
   const latitudeLongitude = [xDimension, yDimension].every(
     (name) => ["lon", "longitude", "lat", "latitude"].includes(String(name).toLowerCase())
   );
@@ -25261,6 +25277,8 @@ function configFromMetadata(metadata, current = {}) {
     gridWidth: selected.array.shape[xIndex],
     gridHeight: selected.array.shape[yIndex],
     nodata: Number.isFinite(Number(selected.array.fill_value)) ? Number(selected.array.fill_value) : -9999,
+    scaleFactor: Number.isFinite(scaleFactor) ? scaleFactor : 1,
+    addOffset: Number.isFinite(addOffset) ? addOffset : 0,
     hasDeclaredRange: Array.isArray(declaredRange) && declaredRange.length >= 2 && declaredRange.every(Number.isFinite),
     hasSuggestedRange: Boolean(suggestedRange),
     palette: selected.name.toLowerCase() === "ndvi" ? "ndvi" : "viridis",
@@ -25308,10 +25326,185 @@ function timeAxis(config) {
   return { values: values2, labels: axisLabels(values2, config) };
 }
 
+// src/pixel-plot.js
+function finiteValues(values2) {
+  return Array.from(
+    values2 ?? [],
+    (value) => value === null || value === void 0 ? NaN : Number(value)
+  ).filter(Number.isFinite);
+}
+function percentile(values2, probability) {
+  const sorted = finiteValues(values2).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const p = Math.max(0, Math.min(1, Number(probability)));
+  const position = (sorted.length - 1) * p;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  const weight = position - lower;
+  return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+}
+function percentileRange(values2, lower = 0.02, upper = 0.98) {
+  const low = percentile(values2, lower);
+  const high = percentile(values2, upper);
+  if (low === null || high === null) return null;
+  if (low !== high) return [low, high];
+  const padding = Math.max(Math.abs(low) * 0.05, 1e-6);
+  return [low - padding, high + padding];
+}
+function pixelPlotLabels(config = {}, labels2 = []) {
+  const variable = String(config.variable ?? "Value").trim() || "Value";
+  const valueLabel = String(config.valueLabel ?? "").trim();
+  const timeDimension = String(config.timeDimension ?? "time").trim() || "time";
+  const usesDates = Boolean(String(config.dateOrigin ?? "").trim()) || labels2.some((label) => /^\d{4}-\d{2}-\d{2}/.test(String(label)));
+  return {
+    x: usesDates ? "Time" : timeDimension,
+    y: valueLabel ? `${variable} (${valueLabel})` : variable
+  };
+}
+function compactNumber(value) {
+  const absolute = Math.abs(value);
+  if (absolute > 0 && absolute < 1e-3 || absolute >= 1e5)
+    return value.toExponential(2);
+  return Number(value.toPrecision(5)).toLocaleString();
+}
+function shorten(value, limit = 32) {
+  const text = String(value ?? "");
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}\u2026`;
+}
+function canvasBlob(canvas) {
+  return new Promise((resolve2, reject) => {
+    canvas.toBlob(
+      (blob) => blob ? resolve2(blob) : reject(new Error("The browser could not create the PNG image.")),
+      "image/png"
+    );
+  });
+}
+async function exportPixelPlotPng({
+  series,
+  labels: labels2,
+  config,
+  point,
+  filename
+}) {
+  const range2 = percentileRange(series);
+  if (!range2) throw new Error("The selected pixel has no finite values to plot.");
+  const [yMin, yMax] = range2;
+  const axis = pixelPlotLabels(config, labels2);
+  const width = 1600;
+  const height = 900;
+  const margin = { top: 145, right: 70, bottom: 155, left: 155 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas rendering is unavailable.");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, width, height);
+  context.fillStyle = "#111827";
+  context.font = "600 38px system-ui, sans-serif";
+  context.fillText(
+    shorten(`${config.name || "Zarr time series"} \u2014 ${config.variable}`, 80),
+    margin.left,
+    58,
+    plotWidth
+  );
+  context.fillStyle = "#4b5563";
+  context.font = "24px system-ui, sans-serif";
+  const coordinates = Array.isArray(point) ? `Pixel: ${point[1].toFixed(5)}\xB0 latitude, ${point[0].toFixed(5)}\xB0 longitude` : "Selected pixel";
+  context.fillText(coordinates, margin.left, 100);
+  context.lineWidth = 1;
+  context.font = "20px system-ui, sans-serif";
+  context.textAlign = "right";
+  context.textBaseline = "middle";
+  for (let index = 0; index <= 5; index += 1) {
+    const ratio = index / 5;
+    const y = margin.top + ratio * plotHeight;
+    const value = yMax - ratio * (yMax - yMin);
+    context.strokeStyle = "#e5e7eb";
+    context.beginPath();
+    context.moveTo(margin.left, y);
+    context.lineTo(margin.left + plotWidth, y);
+    context.stroke();
+    context.fillStyle = "#374151";
+    context.fillText(compactNumber(value), margin.left - 18, y);
+  }
+  const count = Math.max(series.length, labels2.length, 1);
+  const xTickCount = Math.min(6, count);
+  context.textAlign = "right";
+  context.textBaseline = "top";
+  for (let tick = 0; tick < xTickCount; tick += 1) {
+    const index = xTickCount === 1 ? 0 : Math.round(tick / (xTickCount - 1) * (count - 1));
+    const x = margin.left + index / Math.max(1, count - 1) * plotWidth;
+    context.strokeStyle = "#9ca3af";
+    context.beginPath();
+    context.moveTo(x, margin.top + plotHeight);
+    context.lineTo(x, margin.top + plotHeight + 9);
+    context.stroke();
+    context.save();
+    context.translate(x + 4, margin.top + plotHeight + 18);
+    context.rotate(-Math.PI / 6);
+    context.fillStyle = "#374151";
+    context.fillText(shorten(labels2[index] ?? index + 1), 0, 0);
+    context.restore();
+  }
+  context.strokeStyle = "#111827";
+  context.lineWidth = 2;
+  context.strokeRect(margin.left, margin.top, plotWidth, plotHeight);
+  context.strokeStyle = "#2563eb";
+  context.lineWidth = 3;
+  context.lineJoin = "round";
+  context.beginPath();
+  let drawing = false;
+  Array.from(series ?? []).forEach((raw, index) => {
+    const value = Number(raw);
+    if (!Number.isFinite(value)) {
+      drawing = false;
+      return;
+    }
+    const x = margin.left + index / Math.max(1, count - 1) * plotWidth;
+    const clipped = Math.max(yMin, Math.min(yMax, value));
+    const y = margin.top + (yMax - clipped) / (yMax - yMin) * plotHeight;
+    if (drawing) context.lineTo(x, y);
+    else context.moveTo(x, y);
+    drawing = true;
+  });
+  context.stroke();
+  context.fillStyle = "#111827";
+  context.font = "600 24px system-ui, sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "alphabetic";
+  context.fillText(axis.x, margin.left + plotWidth / 2, height - 70);
+  context.save();
+  context.translate(42, margin.top + plotHeight / 2);
+  context.rotate(-Math.PI / 2);
+  context.fillText(axis.y, 0, 0);
+  context.restore();
+  context.fillStyle = "#6b7280";
+  context.font = "19px system-ui, sans-serif";
+  context.textAlign = "right";
+  context.fillText(
+    `Y-axis clipped to the 2nd\u201398th percentiles (${compactNumber(
+      yMin
+    )} to ${compactNumber(yMax)})`,
+    width - margin.right,
+    height - 24
+  );
+  const blob = await canvasBlob(canvas);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 // src/viewer.js
 var ID = "zarr-timeseries-viewer";
 var PANEL = "zarr-timeseries-viewer-panel";
-var VERSION = "0.7.6";
+var VERSION = "0.7.7";
 var PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -25364,7 +25557,9 @@ var DEFAULT_CONFIG = {
   gridVariable: void 0,
   gridWidth: void 0,
   gridHeight: void 0,
-  nodata: -9999
+  nodata: -9999,
+  scaleFactor: 1,
+  addOffset: 0
 };
 var app = null;
 var panel = null;
@@ -25489,6 +25684,21 @@ function applyLayerSpatialMetadata(layer, config) {
 function activeLayer(id = layerId) {
   return id ? nativeLayers.get(id)?.layer ?? null : null;
 }
+function datasetLayerName(config = cfg) {
+  const name = String(config.name ?? "").trim() || "Zarr dataset";
+  return (config.availableVariables?.length ?? 0) > 1 ? `${name} \xB7 ${config.variable}` : name;
+}
+function seriesLayerKey(config = cfg) {
+  const source = config.source === "local" ? `local:${localStoreId}:${config.url}` : `remote:${normalizeStoreUrl(config.url)}`;
+  return `${source}\0${config.variable}`;
+}
+function findSeriesLayerId(config = cfg) {
+  const key2 = seriesLayerKey(config);
+  for (const [id, registration] of nativeLayers) {
+    if (registration.seriesKey === key2) return id;
+  }
+  return null;
+}
 function removeNativeLayer(id) {
   if (!id) return;
   const registration = nativeLayers.get(id);
@@ -25497,7 +25707,7 @@ function removeNativeLayer(id) {
   (registration?.host ?? app)?.unregisterExternalNativeLayer?.(id);
   nativeLayers.delete(id);
 }
-async function addNativeZarrLayer(name, config, selector) {
+async function addNativeZarrLayer(name, config, selector, options = {}) {
   const host = app;
   if (!host) throw new DOMException("Zarr viewer deactivated.", "AbortError");
   const map = host.getMap?.();
@@ -25533,7 +25743,14 @@ async function addNativeZarrLayer(name, config, selector) {
     }
   });
   map.addLayer(layer);
-  nativeLayers.set(id, { layer, name, mapBounds, map, host });
+  nativeLayers.set(id, {
+    layer,
+    name,
+    mapBounds,
+    map,
+    host,
+    seriesKey: options.seriesKey
+  });
   try {
     await layer.ready;
     if (app !== host || !nativeLayers.has(id)) {
@@ -25558,13 +25775,17 @@ async function addNativeZarrLayer(name, config, selector) {
         type: "raster",
         url: sourceUrl(config),
         variable: config.variable,
+        variables: config.availableVariables ?? [],
         selector,
         bounds: mapBounds
       },
       metadata: {
         sourceKind: "zarr-url",
         paintMode: "plugin",
+        datasetName: config.name,
         variable: config.variable,
+        availableVariables: config.availableVariables ?? [],
+        ...options.seriesKey ? { seriesKey: options.seriesKey } : {},
         selector,
         ...config.crs.trim() ? { crs: config.crs.trim() } : {},
         bounds: mapBounds
@@ -25646,7 +25867,11 @@ async function inspectLocalDisplayRange() {
   const array = await open(root2.resolve(cfg.variable), { kind: "array" });
   const chunk = await array.getChunk(Array(array.shape.length).fill(0));
   return {
-    range: finiteRange(chunk.data),
+    range: finiteRange(chunk.data, {
+      fillValue: cfg.nodata,
+      scaleFactor: cfg.scaleFactor,
+      addOffset: cfg.addOffset
+    }),
     reason: "sampled",
     values: chunk.data.length
   };
@@ -25730,6 +25955,24 @@ function currentValue() {
   const value = selectedSeries?.[frame];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
+function captureViewerState() {
+  return {
+    config: { ...cfg },
+    values: [...values],
+    labels: [...labels],
+    frame,
+    selectedPoint: selectedPoint ? [...selectedPoint] : null,
+    selectedSeries: selectedSeries ? [...selectedSeries] : null
+  };
+}
+function restoreViewerState(state) {
+  cfg = state.config;
+  values = state.values;
+  labels = state.labels;
+  frame = state.frame;
+  selectedPoint = state.selectedPoint;
+  selectedSeries = state.selectedSeries;
+}
 function updateUi() {
   if (!panel || !values.length) return;
   const range2 = panel.querySelector("[data-range]");
@@ -25803,6 +26046,7 @@ function flatten(value, result = []) {
 function chart(series) {
   const svg = panel?.querySelector("[data-chart]");
   const summary = panel?.querySelector("[data-summary]");
+  const exportButton = panel?.querySelector("[data-export-pixel-plot]");
   if (!svg || !summary) return;
   const valid = series.filter(
     (item) => typeof item === "number" && Number.isFinite(item)
@@ -25810,8 +26054,10 @@ function chart(series) {
   if (!valid.length) {
     svg.innerHTML = "";
     summary.textContent = "No valid observations at this pixel.";
+    if (exportButton) exportButton.disabled = true;
     return;
   }
+  if (exportButton) exportButton.disabled = false;
   let min = Number(cfg.climMin), max = Number(cfg.climMax);
   if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
     min = Math.min(...valid);
@@ -25851,6 +26097,8 @@ async function inspect(longitude, latitude) {
   queryController = new AbortController();
   selectedPoint = [longitude, latitude];
   selectedSeries = null;
+  const exportButton = panel?.querySelector("[data-export-pixel-plot]");
+  if (exportButton) exportButton.disabled = true;
   const location = panel?.querySelector("[data-location]");
   const summary = panel?.querySelector("[data-summary]");
   if (location)
@@ -25901,6 +26149,41 @@ async function addCurrentAcquisition() {
 function exportFileName(label) {
   const stem = `${cfg.name || cfg.variable}-${cfg.variable}-${label}`.normalize("NFKD").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase();
   return `${stem || "zarr-acquisition"}.tif`;
+}
+function pixelPlotFileName() {
+  const stem = `${cfg.name || "zarr-timeseries"}-${cfg.variable}-pixel-plot`.normalize("NFKD").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase();
+  return `${stem || "zarr-pixel-plot"}.png`;
+}
+async function exportSelectedPixelPlot() {
+  if (!selectedPoint || !selectedSeries) {
+    status("Click a pixel in the active layer before exporting a plot.", "error");
+    return;
+  }
+  const button = panel?.querySelector("[data-export-pixel-plot]");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Creating PNG\u2026";
+  }
+  try {
+    await exportPixelPlotPng({
+      series: selectedSeries,
+      labels,
+      config: cfg,
+      point: selectedPoint,
+      filename: pixelPlotFileName()
+    });
+    status("Exported the selected pixel time series as PNG.", "success");
+  } catch (error) {
+    status(
+      error instanceof Error ? error.message : "Could not export the pixel plot.",
+      "error"
+    );
+  } finally {
+    if (button) {
+      button.disabled = !selectedSeries;
+      button.textContent = "Export pixel plot as PNG";
+    }
+  }
 }
 function numericArray(value, keepMissing = false) {
   return Array.isArray(value) || ArrayBuffer.isView(value) ? Array.from(value, Number).filter(
@@ -26070,12 +26353,23 @@ async function exportCurrentAcquisition() {
     }
   }
 }
-async function load(next = cfg) {
+async function load(next = cfg, options = {}) {
   if (loading) return;
   loading = true;
+  const previousLayerId = layerId;
+  const fallbackState = options.fallbackState ?? captureViewerState();
+  let nextLayerId = null;
+  let createdNextLayer = false;
+  let reusedSeriesLayer = false;
+  const requestedFrame = Number.isInteger(options.frameIndex) ? options.frameIndex : frame;
+  const pointToRefresh = options.preservePoint ? selectedPoint : null;
   try {
     if (!next.variable.trim() || !next.timeDimension.trim())
       throw new Error("Variable and time dimension are required.");
+    if (!hasResolvableCrs(next))
+      throw new Error(
+        "CRS metadata was not found. Enter the dataset CRS (for example, EPSG:32651) before adding this time series."
+      );
     const axis = timeAxis(next), palette = colors(next);
     const clim = [Number(next.climMin), Number(next.climMax)];
     if (clim.some((item) => !Number.isFinite(item)) || clim[0] >= clim[1])
@@ -26084,17 +26378,21 @@ async function load(next = cfg) {
     cfg = { ...next };
     values = axis.values;
     labels = axis.labels;
-    frame = values.length - 1;
-    selectedPoint = null;
+    frame = options.preserveFrame ? Math.max(0, Math.min(values.length - 1, requestedFrame)) : values.length - 1;
+    selectedPoint = pointToRefresh;
     selectedSeries = null;
     status(`Loading ${cfg.variable}\u2026`);
     void palette;
     void clim;
-    if (layerId) removeNativeLayer(layerId);
-    const nextLayerId = await addNativeZarrLayer(
-      cfg.name || `${cfg.variable} time series`,
-      cfg
-    );
+    nextLayerId = options.reuseSeriesLayer ? findSeriesLayerId(cfg) : null;
+    if (nextLayerId) {
+      reusedSeriesLayer = true;
+    } else {
+      nextLayerId = await addNativeZarrLayer(datasetLayerName(cfg), cfg, void 0, {
+        seriesKey: seriesLayerKey(cfg)
+      });
+      createdNextLayer = true;
+    }
     if (!app || !nativeLayers.has(nextLayerId)) {
       removeNativeLayer(nextLayerId);
       throw new DOMException("Zarr viewer deactivated.", "AbortError");
@@ -26106,7 +26404,7 @@ async function load(next = cfg) {
       values = [...detected];
       labels = axisLabels(values, cfg);
       cfg.timeCount = values.length;
-      frame = values.length - 1;
+      frame = options.preserveFrame ? Math.max(0, Math.min(values.length - 1, requestedFrame)) : values.length - 1;
       const layer = activeLayer();
       if (!layer)
         throw new DOMException("Zarr viewer deactivated.", "AbortError");
@@ -26114,18 +26412,36 @@ async function load(next = cfg) {
       if (!app || activeLayer() !== layer)
         throw new DOMException("Zarr viewer deactivated.", "AbortError");
     }
-    try {
-      app.fitBounds?.(datasetMapBounds(cfg));
-    } catch {
+    if (!options.retainPreviousLayer && previousLayerId && previousLayerId !== nextLayerId)
+      removeNativeLayer(previousLayerId);
+    if (options.fitBounds !== false) {
+      try {
+        app.fitBounds?.(datasetMapBounds(cfg));
+      } catch {
+      }
     }
     bindMap();
     render();
+    if (options.openConfig)
+      panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+    const layerPanelMessage = app?.registerExternalNativeLayer ? ` ${datasetLayerName(cfg)} is ${reusedSeriesLayer ? "active in" : "available in"} GeoLibre Layers.` : "";
     status(
-      `Ready. Click the ${cfg.variable} layer to chart a pixel.`,
+      `Ready. Click the ${cfg.variable} layer to chart a pixel.${layerPanelMessage}`,
       "success"
     );
+    if (pointToRefresh)
+      await inspect(pointToRefresh[0], pointToRefresh[1]);
   } catch (error) {
+    if (createdNextLayer && nextLayerId && nextLayerId !== previousLayerId)
+      removeNativeLayer(nextLayerId);
+    layerId = previousLayerId && nativeLayers.has(previousLayerId) ? previousLayerId : null;
     if (error instanceof DOMException && error.name === "AbortError") return;
+    if (layerId) {
+      restoreViewerState(fallbackState);
+      render();
+      if (options.openConfig)
+        panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+    }
     status(
       error instanceof Error ? error.message : typeof error === "string" && error ? error : "Could not load the Zarr data.",
       "error"
@@ -26166,8 +26482,54 @@ function readForm(form) {
     gridVariable: sameGrid ? cfg.gridVariable : void 0,
     gridWidth: sameGrid ? cfg.gridWidth : void 0,
     gridHeight: sameGrid ? cfg.gridHeight : void 0,
-    nodata: sameGrid ? cfg.nodata : -9999
+    nodata: sameGrid ? cfg.nodata : -9999,
+    scaleFactor: sameGrid ? cfg.scaleFactor : 1,
+    addOffset: sameGrid ? cfg.addOffset : 0
   };
+}
+async function switchVariable(form, variable) {
+  const source = form.elements.source.value;
+  const hasActiveLayer = Boolean(layerId);
+  const previousFrame = frame;
+  const fallbackState = captureViewerState();
+  try {
+    cfg = configFromMetadata(inspectedMetadata, {
+      ...readForm(form),
+      variable
+    });
+    if (!hasActiveLayer) {
+      values = [];
+      labels = [];
+    }
+    render();
+    panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+    let selectionMessage = `${cfg.variable} selected. Review the display range before adding the time series.`;
+    if (source === "local" && !cfg.hasDeclaredRange) {
+      status("Reading the first acquisition to determine its display range\u2026");
+      const result = await applyLocalDisplayRange();
+      selectionMessage = result.range ? `${cfg.variable} selected with a derived display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()}.` : result.reason === "suggested" ? `${cfg.variable} selected with the standard NDVI display range of -1 to 1.` : `${cfg.variable} selected. Review the display range before adding the time series.`;
+    }
+    if (hasActiveLayer) {
+      status(`Adding or activating ${cfg.variable}\u2026`);
+      await load(cfg, {
+        preserveFrame: true,
+        frameIndex: previousFrame,
+        preservePoint: true,
+        fitBounds: false,
+        openConfig: true,
+        retainPreviousLayer: true,
+        reuseSeriesLayer: true,
+        fallbackState
+      });
+      return;
+    }
+    status(selectionMessage, "success");
+  } catch (error) {
+    status(
+      error instanceof Error ? error.message : "Could not switch the dataset variable.",
+      "error"
+    );
+  }
 }
 function formHtml() {
   const option = (value, current) => `<option value="${value}" ${value === current ? "selected" : ""}>${value[0].toUpperCase() + value.slice(1)}</option>`;
@@ -26240,7 +26602,7 @@ function formHtml() {
   )}" placeholder="xMin, yMin, xMax, yMax"/></label><label class="ztsv-wide">Map bounds (WGS84)<input name="mapBounds" value="${esc(
     cfg.mapBounds
   )}" placeholder="west, south, east, north"/></label>
-    <button class="ztsv-primary" type="submit">Add time series</button></form></details>`;
+    <button class="ztsv-primary" type="submit">${layerId ? "Apply settings" : "Add time series"}</button></form></details>`;
 }
 function render() {
   if (!panel) return;
@@ -26274,7 +26636,7 @@ function render() {
   )}</span></div><div class="ztsv-legend-labels"><span>Low</span><span>High</span></div></section>
     <section class="ztsv-card ztsv-inspector"><div class="ztsv-section-title"><div><span class="ztsv-eyebrow">Pixel history</span><strong data-location>Click the map</strong></div><span data-current></span></div><svg data-chart class="ztsv-chart" viewBox="0 0 320 112" role="img" aria-label="${esc(
     cfg.variable
-  )} time-series chart"></svg><p data-summary class="ztsv-summary">Click inside the layer footprint to inspect all ${values.length} observations.</p></section>
+  )} time-series chart"></svg><p data-summary class="ztsv-summary">Click inside the layer footprint to inspect all ${values.length} observations.</p><button data-export-pixel-plot class="ztsv-secondary" ${selectedSeries ? "" : "disabled"}>Export pixel plot as PNG</button></section>
     <section class="ztsv-card ztsv-details"><strong>About this dataset</strong><dl><div><dt>Variable</dt><dd>${esc(
     cfg.variable
   )}</dd></div><div><dt>Time axis</dt><dd>${esc(cfg.timeDimension)} \xB7 ${values.length} steps</dd></div><div><dt>CRS</dt><dd>${esc(
@@ -26332,40 +26694,7 @@ function render() {
     const form = event.currentTarget.form;
     if (!inspectedMetadata || !["custom", "local"].includes(form?.elements.source.value))
       return;
-    cfg = configFromMetadata(inspectedMetadata, {
-      ...readForm(form),
-      variable: event.currentTarget.value
-    });
-    values = [];
-    labels = [];
-    render();
-    panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
-    if (form.elements.source.value === "local" && !cfg.hasDeclaredRange) {
-      status("Reading the first acquisition to determine its display range\u2026");
-      void applyLocalDisplayRange().then((result) => {
-        if (!result.range) {
-          status(
-            result.reason === "suggested" ? `${cfg.variable} selected with the standard NDVI display range of -1 to 1.` : `${cfg.variable} selected. Review the display range before adding the time series.`,
-            "success"
-          );
-          return;
-        }
-        status(
-          `${cfg.variable} selected with a derived display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()}.`,
-          "success"
-        );
-      }).catch(
-        (error) => status(
-          error instanceof Error ? error.message : "Could not inspect this variable's display range.",
-          "error"
-        )
-      );
-      return;
-    }
-    status(
-      `${cfg.variable} selected. Review the display range, then add the time series.`,
-      "success"
-    );
+    void switchVariable(form, event.currentTarget.value);
   });
   const folderInput = panel.querySelector("[data-folder-input]");
   panel.querySelector("[data-folder]")?.addEventListener("click", () => folderInput?.click());
@@ -26394,6 +26723,7 @@ function render() {
   });
   panel.querySelector("[data-add-acquisition]")?.addEventListener("click", () => void addCurrentAcquisition());
   panel.querySelector("[data-export-acquisition]")?.addEventListener("click", () => void exportCurrentAcquisition());
+  panel.querySelector("[data-export-pixel-plot]")?.addEventListener("click", () => void exportSelectedPixelPlot());
   panel.querySelector("[data-prev]")?.addEventListener("click", () => {
     stop();
     void show(frame - 1);
