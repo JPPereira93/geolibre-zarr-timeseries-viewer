@@ -8,6 +8,8 @@ await build({
   format: "esm",
   platform: "browser",
   target: ["es2022"],
+  supported: { "template-literal": false },
+  minify: true,
   outfile: "geolibre-plugin/viewer.js",
   legalComments: "none",
 });

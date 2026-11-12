@@ -14,7 +14,7 @@ import { exportPixelPlotPng } from "./pixel-plot.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.7";
+const VERSION = "0.7.8";
 const PALETTES = {
   ndvi: [
     "#7f3b08",
