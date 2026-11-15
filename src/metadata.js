@@ -133,6 +133,48 @@ export function finiteRange(
   return [minimum, maximum];
 }
 
+export function finitePercentileRange(
+  values,
+  {
+    fillValue,
+    scaleFactor = 1,
+    addOffset = 0,
+    lower = 0.02,
+    upper = 0.98,
+  } = {}
+) {
+  const numericFillValue = Number(fillValue);
+  const hasFillValue =
+    fillValue !== undefined &&
+    fillValue !== null &&
+    Number.isFinite(numericFillValue);
+  const scale = Number.isFinite(Number(scaleFactor)) ? Number(scaleFactor) : 1;
+  const offset = Number.isFinite(Number(addOffset)) ? Number(addOffset) : 0;
+  const physical = Array.from(values ?? [], Number)
+    .filter(
+      (value) =>
+        Number.isFinite(value) && (!hasFillValue || value !== numericFillValue)
+    )
+    .map((value) => value * scale + offset)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  if (!physical.length) return null;
+  const quantile = (probability) => {
+    const position =
+      (physical.length - 1) * Math.max(0, Math.min(1, Number(probability)));
+    const before = Math.floor(position);
+    const after = Math.ceil(position);
+    if (before === after) return physical[before];
+    const weight = position - before;
+    return physical[before] * (1 - weight) + physical[after] * weight;
+  };
+  const minimum = quantile(lower);
+  const maximum = quantile(upper);
+  if (minimum !== maximum) return [minimum, maximum];
+  const padding = Math.max(Math.abs(minimum) * 0.01, 0.5);
+  return [minimum - padding, maximum + padding];
+}
+
 function multiscaleVariables(arrays, rootAttrs) {
   const paths = rootAttrs?.multiscales?.[0]?.datasets
     ?.map((dataset) => String(dataset?.path ?? "").replace(/^\/+|\/+$/g, ""))
@@ -339,6 +381,70 @@ export function configFromMetadata(metadata, current = {}) {
   const timeIndex = dimensions.indexOf(timeDimension);
   const xIndex = dimensions.indexOf(xDimension);
   const yIndex = dimensions.indexOf(yDimension);
+  const variableDirectory = selected.metadataName.includes("/")
+    ? selected.metadataName.slice(0, selected.metadataName.lastIndexOf("/") + 1)
+    : "";
+  const coordinateArrays = Object.entries(metadata)
+    .filter(([key, value]) => key.endsWith("/.zarray") && Array.isArray(value?.shape))
+    .map(([key, array]) => {
+      const path = key.slice(0, -8);
+      return {
+        path,
+        name: path.split("/").at(-1),
+        array,
+        attrs: metadata[`${path}/.zattrs`] ?? {},
+      };
+    });
+  const coordinateNames = String(variableAttrs.coordinates ?? "")
+    .split(/\s+/)
+    .filter(Boolean);
+  const previousSelectors = new Map(
+    (current.dimensionSelectors ?? []).map((selector) => [selector.name, selector])
+  );
+  const dimensionSelectors = dimensions
+    .map((name, dimensionIndex) => ({ name, dimensionIndex }))
+    .filter(
+      ({ name }) =>
+        name !== timeDimension && name !== xDimension && name !== yDimension
+    )
+    .map(({ name, dimensionIndex }) => {
+      const candidates = coordinateArrays.filter(
+        (item) =>
+          Array.isArray(item.attrs._ARRAY_DIMENSIONS) &&
+          item.attrs._ARRAY_DIMENSIONS.length === 1 &&
+          item.attrs._ARRAY_DIMENSIONS[0] === name
+      );
+      const preferredPath = `${variableDirectory}${name}`;
+      const coordinate =
+        candidates.find((item) => item.path === preferredPath) ??
+        candidates.find((item) => item.name === name);
+      const namedCoordinates = candidates.filter((item) =>
+        coordinateNames.includes(item.name)
+      );
+      const scale =
+        namedCoordinates.find((item) => /(?:^|_)scale$/i.test(item.name)) ??
+        candidates.find((item) => /(?:^|_)scale$/i.test(item.name));
+      const offset =
+        namedCoordinates.find((item) => /(?:^|_)offset$/i.test(item.name)) ??
+        candidates.find((item) => /(?:^|_)offset$/i.test(item.name));
+      const previous = previousSelectors.get(name);
+      const size = selected.array.shape[dimensionIndex] ?? 1;
+      return {
+        name,
+        dimensionIndex,
+        size,
+        coordinatePath: coordinate?.path ?? "",
+        scalePath: scale?.path ?? "",
+        offsetPath: offset?.path ?? "",
+        values: previous?.values ?? [],
+        scales: previous?.scales ?? [],
+        offsets: previous?.offsets ?? [],
+        selectedIndex: Math.max(
+          0,
+          Math.min(size - 1, Number(previous?.selectedIndex) || 0)
+        ),
+      };
+    });
   const coordinate =
     metadata[
       `${selected.metadataName.slice(
@@ -390,7 +496,9 @@ export function configFromMetadata(metadata, current = {}) {
       (current.variable === selected.name && current.valueLabel
         ? current.valueLabel
         : selected.name),
+    dimensions,
     timeDimension,
+    dimensionSelectors,
     timeCount: selected.array.shape[timeIndex >= 0 ? timeIndex : 0] ?? 1,
     timeStart: 0,
     timeStep: 1,

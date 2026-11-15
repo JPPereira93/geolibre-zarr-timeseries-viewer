@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   configFromLayerSpatialMetadata,
   configFromMetadata,
+  finitePercentileRange,
   finiteRange,
   hasResolvableCrs,
   metadataFromDocument,
@@ -65,6 +66,43 @@ test("discovers variables and dimensions in a consolidated v2 store", async () =
   });
   assert.equal(precipitation.variable, "precipitation");
   assert.equal(precipitation.gridVariable, "precipitation");
+});
+
+test("discovers labelled non-spatial dimensions and their packed-value transforms", () => {
+  const metadata = {
+    ".zattrs": {},
+    "features/.zarray": { shape: [10, 20, 605, 569], fill_value: -32768 },
+    "features/.zattrs": {
+      _ARRAY_DIMENSIONS: ["year", "feature", "y", "x"],
+      coordinates: "feature_offset feature_scale spatial_ref",
+    },
+    "feature/.zarray": { shape: [20] },
+    "feature/.zattrs": { _ARRAY_DIMENSIONS: ["feature"] },
+    "feature_scale/.zarray": { shape: [20] },
+    "feature_scale/.zattrs": { _ARRAY_DIMENSIONS: ["feature"] },
+    "feature_offset/.zarray": { shape: [20] },
+    "feature_offset/.zattrs": { _ARRAY_DIMENSIONS: ["feature"] },
+    "year/.zarray": { shape: [10] },
+    "year/.zattrs": { _ARRAY_DIMENSIONS: ["year"] },
+  };
+  const config = configFromMetadata(metadata, {});
+  assert.equal(config.variable, "features");
+  assert.equal(config.timeDimension, "year");
+  assert.equal(config.timeCount, 10);
+  assert.deepEqual(config.dimensionSelectors, [
+    {
+      name: "feature",
+      dimensionIndex: 1,
+      size: 20,
+      coordinatePath: "feature",
+      scalePath: "feature_scale",
+      offsetPath: "feature_offset",
+      values: [],
+      scales: [],
+      offsets: [],
+      selectedIndex: 0,
+    },
+  ]);
 });
 
 test("collapses multiscale level paths into logical variable names", () => {
@@ -299,6 +337,22 @@ test("derives physical ranges from packed values and excludes fill values", () =
   assert.deepEqual(
     finiteRange([0, 10], { scaleFactor: 0.5, addOffset: -2 }),
     [-2, 3]
+  );
+});
+
+test("derives robust physical display ranges without extreme outliers", () => {
+  assert.deepEqual(
+    finitePercentileRange([0, 1, 2, 3, 4, 1000], {
+      scaleFactor: 2,
+      addOffset: 10,
+      lower: 0.2,
+      upper: 0.8,
+    }),
+    [12, 18]
+  );
+  assert.deepEqual(
+    finitePercentileRange([-32768, 5, 5], { fillValue: -32768 }),
+    [4.5, 5.5]
   );
 });
 

@@ -3,7 +3,7 @@ import * as zarr from "zarrita";
 import {
   configFromMetadata,
   configFromLayerSpatialMetadata,
-  finiteRange,
+  finitePercentileRange,
   hasResolvableCrs,
   metadataFromDocument,
   normalizeStoreUrl,
@@ -14,7 +14,7 @@ import { exportPixelPlotPng } from "./pixel-plot.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.8";
+const VERSION = "0.7.9";
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -45,6 +45,7 @@ const DEFAULT_CONFIG = {
   name: "Zarr time series",
   variable: "",
   availableVariables: [],
+  dimensionSelectors: [],
   valueLabel: "",
   timeDimension: "time",
   timeValuesText: "",
@@ -75,6 +76,8 @@ let app = null;
 let panel = null;
 let control = null;
 let unregister = null;
+let selectionUnregister = null;
+let selectionSwitchToken = 0;
 let layerId = null;
 let mapClick = null;
 let queryController = null;
@@ -143,6 +146,63 @@ function sourceUrl(config) {
 function storeForConfig(config) {
   if (config.source === "local") return localStore;
   return null;
+}
+
+function selectedDimensionValue(selector) {
+  return selector.values?.[selector.selectedIndex] ?? selector.selectedIndex;
+}
+
+function dimensionSelection(config = cfg) {
+  return Object.fromEntries(
+    (config.dimensionSelectors ?? []).map((selector) => [
+      selector.name,
+      selectedDimensionValue(selector),
+    ])
+  );
+}
+
+function selectorWithTime(config, time) {
+  return { ...dimensionSelection(config), [config.timeDimension]: time };
+}
+
+function selectedDimensionLabel(config = cfg) {
+  return (config.dimensionSelectors ?? [])
+    .map((selector) => String(selectedDimensionValue(selector)))
+    .join(" · ");
+}
+
+function displayedVariable(config = cfg) {
+  return selectedDimensionLabel(config) || config.valueLabel || config.variable;
+}
+
+function selectedExternalTransform(config = cfg) {
+  let scaleFactor = 1;
+  let addOffset = 0;
+  for (const selector of config.dimensionSelectors ?? []) {
+    const scale = Number(selector.scales?.[selector.selectedIndex]);
+    const offset = Number(selector.offsets?.[selector.selectedIndex]);
+    const nextScale = Number.isFinite(scale) ? scale : 1;
+    const nextOffset = Number.isFinite(offset) ? offset : 0;
+    scaleFactor *= nextScale;
+    addOffset = addOffset * nextScale + nextOffset;
+  }
+  return { scaleFactor, addOffset };
+}
+
+function transformExternalValue(value, config = cfg) {
+  if (!Number.isFinite(Number(value))) return value;
+  const transform = selectedExternalTransform(config);
+  return Number(value) * transform.scaleFactor + transform.addOffset;
+}
+
+function renderClim(config = cfg) {
+  const transform = selectedExternalTransform(config);
+  if (transform.scaleFactor === 0) return [Number(config.climMin), Number(config.climMax)];
+  const range = [
+    (Number(config.climMin) - transform.addOffset) / transform.scaleFactor,
+    (Number(config.climMax) - transform.addOffset) / transform.scaleFactor,
+  ];
+  return range[0] <= range[1] ? range : [range[1], range[0]];
 }
 
 function hasConfiguredSource(config = cfg) {
@@ -220,11 +280,82 @@ function activeLayer(id = layerId) {
   return id ? nativeLayers.get(id)?.layer ?? null : null;
 }
 
+function cloneConfig(config) {
+  return {
+    ...config,
+    availableVariables: [...(config.availableVariables ?? [])],
+    dimensions: [...(config.dimensions ?? [])],
+    dimensionSelectors: (config.dimensionSelectors ?? []).map((selector) => ({
+      ...selector,
+      values: [...(selector.values ?? [])],
+      scales: [...(selector.scales ?? [])],
+      offsets: [...(selector.offsets ?? [])],
+    })),
+  };
+}
+
+function persistActiveSeriesState() {
+  const registration = nativeLayers.get(layerId);
+  if (!registration?.seriesKey) return;
+  registration.config = cloneConfig(cfg);
+  registration.values = [...values];
+  registration.labels = [...labels];
+  registration.frame = frame;
+}
+
+async function activateRegisteredSeries(id) {
+  const registration = nativeLayers.get(id);
+  if (
+    loading ||
+    !registration?.seriesKey ||
+    !registration.config ||
+    id === layerId
+  )
+    return;
+  const token = ++selectionSwitchToken;
+  stop();
+  queryController?.abort();
+  layerId = id;
+  cfg = cloneConfig(registration.config);
+  const axis = timeAxis(cfg);
+  values = registration.values?.length ? [...registration.values] : axis.values;
+  labels = registration.labels?.length
+    ? [...registration.labels]
+    : axisLabels(values, cfg);
+  frame = Math.max(
+    0,
+    Math.min(values.length - 1, Number(registration.frame) || 0)
+  );
+  selectedSeries = null;
+  render();
+  status(`Selected ${datasetLayerName(cfg)}. Updating pixel history…`);
+  try {
+    await registration.layer.setSelector(selectorWithTime(cfg, values[frame]));
+    if (token !== selectionSwitchToken || layerId !== id) return;
+    if (selectedPoint) {
+      await inspect(selectedPoint[0], selectedPoint[1]);
+      if (token !== selectionSwitchToken || layerId !== id) return;
+    }
+    status(`Showing ${datasetLayerName(cfg)}.`, "success");
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") return;
+    if (token !== selectionSwitchToken || layerId !== id) return;
+    status(
+      error instanceof Error
+        ? error.message
+        : "Could not activate the selected Zarr layer.",
+      "error"
+    );
+  }
+}
+
 function datasetLayerName(config = cfg) {
   const name = String(config.name ?? "").trim() || "Zarr dataset";
-  return (config.availableVariables?.length ?? 0) > 1
-    ? `${name} · ${config.variable}`
-    : name;
+  const details = [];
+  if ((config.availableVariables?.length ?? 0) > 1) details.push(config.variable);
+  const dimensionLabel = selectedDimensionLabel(config);
+  if (dimensionLabel) details.push(dimensionLabel);
+  return details.length ? `${name} · ${details.join(" · ")}` : name;
 }
 
 function seriesLayerKey(config = cfg) {
@@ -232,7 +363,10 @@ function seriesLayerKey(config = cfg) {
     config.source === "local"
       ? `local:${localStoreId}:${config.url}`
       : `remote:${normalizeStoreUrl(config.url)}`;
-  return `${source}\u0000${config.variable}`;
+  const selection = (config.dimensionSelectors ?? [])
+    .map((selector) => `${selector.name}=${String(selectedDimensionValue(selector))}`)
+    .join("\u0001");
+  return `${source}\u0000${config.variable}\u0000${selection}`;
 }
 
 function findSeriesLayerId(config = cfg) {
@@ -273,8 +407,8 @@ async function addNativeZarrLayer(name, config, selector, options = {}) {
       ? { store: storeForConfig(config) }
       : { source: sourceUrl(config) }),
     variable: config.variable,
-    selector,
-    clim: [Number(config.climMin), Number(config.climMax)],
+    selector: { ...dimensionSelection(config), ...(selector ?? {}) },
+    clim: renderClim(config),
     colormap: colors(config),
     opacity: 0.9,
     zarrVersion: Number(config.zarrVersion),
@@ -297,6 +431,10 @@ async function addNativeZarrLayer(name, config, selector, options = {}) {
     map,
     host,
     seriesKey: options.seriesKey,
+    config: options.seriesKey ? cloneConfig(config) : null,
+    values: [],
+    labels: [],
+    frame: 0,
   });
   try {
     await layer.ready;
@@ -307,6 +445,8 @@ async function addNativeZarrLayer(name, config, selector, options = {}) {
     applyLayerSpatialMetadata(layer, config);
     mapBounds = datasetMapBounds(config);
     nativeLayers.get(id).mapBounds = mapBounds;
+    if (options.seriesKey)
+      nativeLayers.get(id).config = cloneConfig(config);
     host.registerExternalNativeLayer?.({
       id,
       name,
@@ -323,7 +463,7 @@ async function addNativeZarrLayer(name, config, selector, options = {}) {
         url: sourceUrl(config),
         variable: config.variable,
         variables: config.availableVariables ?? [],
-        selector,
+        selector: { ...dimensionSelection(config), ...(selector ?? {}) },
         bounds: mapBounds,
       },
       metadata: {
@@ -333,7 +473,7 @@ async function addNativeZarrLayer(name, config, selector, options = {}) {
         variable: config.variable,
         availableVariables: config.availableVariables ?? [],
         ...(options.seriesKey ? { seriesKey: options.seriesKey } : {}),
-        selector,
+        selector: { ...dimensionSelection(config), ...(selector ?? {}) },
         ...(config.crs.trim() ? { crs: config.crs.trim() } : {}),
         bounds: mapBounds,
       },
@@ -346,16 +486,55 @@ async function addNativeZarrLayer(name, config, selector, options = {}) {
   return id;
 }
 
-function applyInspectedMetadata(metadata, next, zarrVersion) {
+async function readSmallCoordinateArray(store, path, size) {
+  if (!path || size > 10_000) return [];
+  const root = await zarr.open(store, { kind: "group" });
+  const array = await zarr.open(root.resolve(path), { kind: "array" });
+  const result = await zarr.get(array);
+  return Array.from(result.data ?? result);
+}
+
+async function hydrateDimensionSelectors(config) {
+  if (!(config.dimensionSelectors ?? []).length) return config;
+  const store =
+    config.source === "local"
+      ? localStore
+      : new zarr.FetchStore(normalizeStoreUrl(config.url));
+  if (!store) return config;
+  const dimensionSelectors = await Promise.all(
+    config.dimensionSelectors.map(async (selector) => {
+      const [coordinateResult, scaleResult, offsetResult] = await Promise.allSettled([
+        readSmallCoordinateArray(store, selector.coordinatePath, selector.size),
+        readSmallCoordinateArray(store, selector.scalePath, selector.size),
+        readSmallCoordinateArray(store, selector.offsetPath, selector.size),
+      ]);
+      const values =
+        coordinateResult.status === "fulfilled" && coordinateResult.value.length
+          ? coordinateResult.value
+          : Array.from({ length: selector.size }, (_, index) => index);
+      return {
+        ...selector,
+        values,
+        scales: scaleResult.status === "fulfilled" ? scaleResult.value : [],
+        offsets: offsetResult.status === "fulfilled" ? offsetResult.value : [],
+      };
+    })
+  );
+  return { ...config, dimensionSelectors };
+}
+
+async function applyInspectedMetadata(metadata, next, zarrVersion) {
   inspectedMetadata = metadata;
-  cfg = configFromMetadata(metadata, {
-    ...next,
-    zarrVersion,
-    crs: "",
-    proj4: "",
-    sourceBounds: "",
-    mapBounds: "",
-  });
+  cfg = await hydrateDimensionSelectors(
+    configFromMetadata(metadata, {
+      ...next,
+      zarrVersion,
+      crs: "",
+      proj4: "",
+      sourceBounds: "",
+      mapBounds: "",
+    })
+  );
   values = [];
   labels = [];
   render();
@@ -380,7 +559,7 @@ async function inspectRemoteStore(form) {
       fetch,
       metadataController.signal
     );
-    applyInspectedMetadata(
+    await applyInspectedMetadata(
       discovered.metadata,
       {
         ...next,
@@ -399,12 +578,12 @@ async function inspectRemoteStore(form) {
   }
 }
 
-function inspectLocalStore(form) {
+async function inspectLocalStore(form) {
   if (!localStore || !inspectedMetadata) {
     throw new Error("Choose a Zarr folder before reading its metadata.");
   }
   const next = readForm(form);
-  applyInspectedMetadata(
+  await applyInspectedMetadata(
     inspectedMetadata,
     { ...next, source: "local", url: cfg.url },
     cfg.zarrVersion
@@ -419,16 +598,66 @@ async function inspectLocalDisplayRange() {
     return { range: null, reason: "suggested", values: 0 };
   const root = await zarr.open(localStore, { kind: "group" });
   const array = await zarr.open(root.resolve(cfg.variable), { kind: "array" });
-  const chunk = await array.getChunk(Array(array.shape.length).fill(0));
-  return {
-    range: finiteRange(chunk.data, {
+  const baseCoordinates = Array(array.shape.length).fill(0);
+  for (const selector of cfg.dimensionSelectors ?? []) {
+    baseCoordinates[selector.dimensionIndex] = Math.floor(
+      selector.selectedIndex / array.chunks[selector.dimensionIndex]
+    );
+  }
+  const selected = new Map(
+    (cfg.dimensionSelectors ?? []).map((selector) => [
+      selector.dimensionIndex,
+      selector.selectedIndex % array.chunks[selector.dimensionIndex],
+    ])
+  );
+  const external = selectedExternalTransform(cfg);
+  const xIndex = (cfg.dimensions ?? []).indexOf(cfg.xDimension);
+  const yIndex = (cfg.dimensions ?? []).indexOf(cfg.yDimension);
+  const chunkCounts = array.shape.map((size, index) =>
+    Math.ceil(size / array.chunks[index])
+  );
+  const fractions = [0.5, 0.25, 0.75, 0];
+  const candidates = fractions.map((fraction) => {
+    const coordinates = [...baseCoordinates];
+    if (xIndex >= 0)
+      coordinates[xIndex] = Math.min(
+        chunkCounts[xIndex] - 1,
+        Math.floor(chunkCounts[xIndex] * fraction)
+      );
+    if (yIndex >= 0)
+      coordinates[yIndex] = Math.min(
+        chunkCounts[yIndex] - 1,
+        Math.floor(chunkCounts[yIndex] * fraction)
+      );
+    return coordinates;
+  });
+  let sampledCount = 0;
+  for (const chunkCoordinates of candidates) {
+    const chunk = await array.getChunk(chunkCoordinates);
+    const chunkShape = array.shape.map((size, index) =>
+      Math.min(
+        array.chunks[index],
+        size - chunkCoordinates[index] * array.chunks[index]
+      )
+    );
+    const sampledValues = Array.from(chunk.data).filter((_, flatIndex) => {
+      let remainder = flatIndex;
+      for (let index = chunkShape.length - 1; index >= 0; index -= 1) {
+        const coordinate = remainder % chunkShape[index];
+        remainder = Math.floor(remainder / chunkShape[index]);
+        if (selected.has(index) && selected.get(index) !== coordinate) return false;
+      }
+      return true;
+    });
+    sampledCount += sampledValues.length;
+    const range = finitePercentileRange(sampledValues, {
       fillValue: cfg.nodata,
-      scaleFactor: cfg.scaleFactor,
-      addOffset: cfg.addOffset,
-    }),
-    reason: "sampled",
-    values: chunk.data.length,
-  };
+      scaleFactor: cfg.scaleFactor * external.scaleFactor,
+      addOffset: cfg.addOffset * external.scaleFactor + external.addOffset,
+    });
+    if (range) return { range, reason: "sampled", values: sampledCount };
+  }
+  return { range: null, reason: "empty-sample", values: sampledCount };
 }
 async function applyLocalDisplayRange() {
   const result = await inspectLocalDisplayRange();
@@ -487,7 +716,7 @@ async function chooseFolder(fileList) {
   const discovered = metadataFromDocument(
     JSON.parse(await metadataFile.text())
   );
-  applyInspectedMetadata(
+  await applyInspectedMetadata(
     discovered.metadata,
     {
       ...cfg,
@@ -503,7 +732,7 @@ async function chooseFolder(fileList) {
     status(
       `Found ${cfg.availableVariables.length} data variable${
         cfg.availableVariables.length === 1 ? "" : "s"
-      } and derived a display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()} from a small sample chunk.`,
+      } and derived a robust display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()} from the 2nd–98th percentiles of a small sample.`,
       "success"
     );
   } else if (result.reason === "suggested") {
@@ -570,8 +799,8 @@ function updateUi() {
   if (current)
     current.textContent =
       value === null
-        ? `No valid ${cfg.variable} value`
-        : `${cfg.valueLabel || cfg.variable} ${value.toFixed(3)}`;
+        ? `No valid ${displayedVariable()} value`
+        : `${displayedVariable()} ${value.toFixed(3)}`;
   const x = 10 + (frame / Math.max(1, values.length - 1)) * 300;
   if (cursor) {
     cursor.setAttribute("x1", String(x));
@@ -584,9 +813,8 @@ async function show(next) {
   const layer = activeLayer();
   if (!layer) return;
   try {
-    await layer.setSelector({
-      [cfg.timeDimension]: values[frame],
-    });
+    await layer.setSelector(selectorWithTime(cfg, values[frame]));
+    persistActiveSeriesState();
   } catch (error) {
     status(
       error instanceof Error
@@ -686,10 +914,12 @@ async function inspect(longitude, latitude) {
   try {
     const result = await layer.queryData(
       { type: "Point", coordinates: [longitude, latitude] },
-      { [cfg.timeDimension]: values },
+      selectorWithTime(cfg, values),
       { signal: queryController.signal, includeSpatialCoordinates: false }
     );
-    const found = flatten(result?.[cfg.variable]);
+    const found = flatten(result?.[cfg.variable]).map((value) =>
+      value === null ? null : transformExternalValue(value)
+    );
     selectedSeries = Array.from(
       { length: values.length },
       (_, index) => found[index] ?? null
@@ -713,9 +943,11 @@ async function addCurrentAcquisition() {
   addingAcquisition = true;
   const label = labels[frame] ?? `${cfg.timeDimension} ${values[frame]}`;
   try {
-    await addNativeZarrLayer(`${cfg.name || cfg.variable} — ${label}`, cfg, {
-      [cfg.timeDimension]: values[frame],
-    });
+    await addNativeZarrLayer(
+      `${datasetLayerName(cfg)} — ${label}`,
+      cfg,
+      selectorWithTime(cfg, values[frame])
+    );
     status(`Added ${label} as a separate map layer.`, "success");
   } catch (error) {
     status(
@@ -729,7 +961,7 @@ async function addCurrentAcquisition() {
   }
 }
 function exportFileName(label) {
-  const stem = `${cfg.name || cfg.variable}-${cfg.variable}-${label}`
+  const stem = `${cfg.name || cfg.variable}-${displayedVariable()}-${label}`
     .normalize("NFKD")
     .replace(/[^a-z0-9]+/gi, "-")
     .replace(/^-+|-+$/g, "")
@@ -738,7 +970,7 @@ function exportFileName(label) {
 }
 
 function pixelPlotFileName() {
-  const stem = `${cfg.name || "zarr-timeseries"}-${cfg.variable}-pixel-plot`
+  const stem = `${cfg.name || "zarr-timeseries"}-${displayedVariable()}-pixel-plot`
     .normalize("NFKD")
     .replace(/[^a-z0-9]+/gi, "-")
     .replace(/^-+|-+$/g, "")
@@ -760,7 +992,11 @@ async function exportSelectedPixelPlot() {
     await exportPixelPlotPng({
       series: selectedSeries,
       labels,
-      config: cfg,
+      config: {
+        ...cfg,
+        variable: displayedVariable(),
+        valueLabel: cfg.valueLabel === cfg.variable ? "" : cfg.valueLabel,
+      },
       point: selectedPoint,
       filename: pixelPlotFileName(),
     });
@@ -801,7 +1037,9 @@ function queryResultToRaster(result) {
   const yDimension = cfg.yDimension || result.dimensions?.at(-2);
   const x = numericArray(result.coordinates?.[xDimension]);
   const y = numericArray(result.coordinates?.[yDimension]);
-  const data = numericArray(result[cfg.variable], true);
+  const data = numericArray(result[cfg.variable], true).map((value) =>
+    transformExternalValue(value)
+  );
   if (!data.length || data.length !== x.length || data.length !== y.length)
     throw new Error("The selected acquisition contains no exportable pixels.");
   const uniqueX = [...new Set(x)].sort((a, b) => a - b);
@@ -946,7 +1184,7 @@ async function exportCurrentAcquisition() {
     };
     const result = await activeLayer().queryData(
       geometry,
-      { [cfg.timeDimension]: values[frame] },
+      selectorWithTime(cfg, values[frame]),
       { includeSpatialCoordinates: true, level: "finest" }
     );
     const bytes = await rasterToCog(queryResultToRaster(result));
@@ -1011,9 +1249,12 @@ async function load(next = cfg, options = {}) {
     if (nextLayerId) {
       reusedSeriesLayer = true;
     } else {
-      nextLayerId = await addNativeZarrLayer(datasetLayerName(cfg), cfg, undefined, {
-        seriesKey: seriesLayerKey(cfg),
-      });
+      nextLayerId = await addNativeZarrLayer(
+        datasetLayerName(cfg),
+        cfg,
+        dimensionSelection(cfg),
+        { seriesKey: seriesLayerKey(cfg) }
+      );
       createdNextLayer = true;
     }
     if (!app || !nativeLayers.has(nextLayerId)) {
@@ -1033,7 +1274,7 @@ async function load(next = cfg, options = {}) {
       const layer = activeLayer();
       if (!layer)
         throw new DOMException("Zarr viewer deactivated.", "AbortError");
-      await layer.setSelector({ [cfg.timeDimension]: values[frame] });
+      await layer.setSelector(selectorWithTime(cfg, values[frame]));
       if (!app || activeLayer() !== layer)
         throw new DOMException("Zarr viewer deactivated.", "AbortError");
     }
@@ -1043,6 +1284,7 @@ async function load(next = cfg, options = {}) {
       previousLayerId !== nextLayerId
     )
       removeNativeLayer(previousLayerId);
+    persistActiveSeriesState();
     if (options.fitBounds !== false) {
       try {
         app.fitBounds?.(datasetMapBounds(cfg));
@@ -1102,6 +1344,14 @@ function readForm(form) {
     name: get("name"),
     variable,
     availableVariables: cfg.availableVariables ?? [],
+    dimensionSelectors: (cfg.dimensionSelectors ?? []).map((selector, index) => ({
+      ...selector,
+      selectedIndex: Math.max(
+        0,
+        Math.min(selector.size - 1, Number(get(`dimension-${index}`)) || 0)
+      ),
+    })),
+    dimensions: cfg.dimensions ?? [],
     valueLabel: get("valueLabel"),
     timeDimension: get("timeDimension"),
     timeValuesText: get("timeValuesText"),
@@ -1127,6 +1377,8 @@ function readForm(form) {
     nodata: sameGrid ? cfg.nodata : -9999,
     scaleFactor: sameGrid ? cfg.scaleFactor : 1,
     addOffset: sameGrid ? cfg.addOffset : 0,
+    hasDeclaredRange: sameGrid ? cfg.hasDeclaredRange : false,
+    hasSuggestedRange: sameGrid ? cfg.hasSuggestedRange : false,
   };
 }
 
@@ -1136,10 +1388,12 @@ async function switchVariable(form, variable) {
   const previousFrame = frame;
   const fallbackState = captureViewerState();
   try {
-    cfg = configFromMetadata(inspectedMetadata, {
-      ...readForm(form),
-      variable,
-    });
+    cfg = await hydrateDimensionSelectors(
+      configFromMetadata(inspectedMetadata, {
+        ...readForm(form),
+        variable,
+      })
+    );
     if (!hasActiveLayer) {
       values = [];
       labels = [];
@@ -1152,7 +1406,7 @@ async function switchVariable(form, variable) {
       status("Reading the first acquisition to determine its display range…");
       const result = await applyLocalDisplayRange();
       selectionMessage = result.range
-        ? `${cfg.variable} selected with a derived display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()}.`
+        ? `${cfg.variable} selected with a robust 2nd–98th percentile display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()}.`
         : result.reason === "suggested"
         ? `${cfg.variable} selected with the standard NDVI display range of -1 to 1.`
         : `${cfg.variable} selected. Review the display range before adding the time series.`;
@@ -1183,6 +1437,39 @@ async function switchVariable(form, variable) {
   }
 }
 
+async function switchDimension(form) {
+  const hasActiveLayer = Boolean(layerId);
+  const previousFrame = frame;
+  const fallbackState = captureViewerState();
+  try {
+    cfg = readForm(form);
+    const label = displayedVariable(cfg);
+    render();
+    panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
+    if (cfg.source === "local" && !cfg.hasDeclaredRange) {
+      status(`Reading a small ${label} sample to determine its display range…`);
+      await applyLocalDisplayRange();
+    }
+    if (hasActiveLayer) {
+      status(`Adding or activating ${label}…`);
+      await load(cfg, {
+        preserveFrame: true,
+        frameIndex: previousFrame,
+        preservePoint: true,
+        fitBounds: false,
+        openConfig: true,
+        retainPreviousLayer: true,
+        reuseSeriesLayer: true,
+        fallbackState,
+      });
+      return;
+    }
+    status(`${label} selected. Review the display range before adding the time series.`, "success");
+  } catch (error) {
+    status(error instanceof Error ? error.message : "Could not switch the dimension value.", "error");
+  }
+}
+
 function formHtml() {
   const option = (value, current) =>
     `<option value="${value}" ${value === current ? "selected" : ""}>${
@@ -1199,6 +1486,20 @@ function formHtml() {
         )
         .join("")}</select>`
     : `<input name="variable" value="${esc(cfg.variable)}" required/>`;
+  const dimensionControls = (cfg.dimensionSelectors ?? [])
+    .map((selector, index) => {
+      const label = String(selector.name)
+        .replaceAll("_", " ")
+        .replace(/^./, (character) => character.toUpperCase());
+      const options = Array.from({ length: selector.size }, (_, valueIndex) => {
+        const value = selector.values?.[valueIndex] ?? valueIndex;
+        return `<option value="${valueIndex}" ${
+          valueIndex === selector.selectedIndex ? "selected" : ""
+        }>${esc(value)}</option>`;
+      }).join("");
+      return `<label>${esc(label)}<select name="dimension-${index}" data-dimension-selector>${options}</select></label>`;
+    })
+    .join("");
   return `<details class="ztsv-config"><summary>Data source and display settings</summary><form data-form>
     <label>Source<select name="source">${
     cfg.source === "local"
@@ -1215,7 +1516,7 @@ function formHtml() {
     )}" placeholder="https://example.com/cube.zarr"/></label><button class="ztsv-secondary ztsv-wide" type="button" data-inspect-url>Read metadata and variables</button>
     <label>Layer name<input name="name" value="${esc(
       cfg.name
-    )}"/></label><label>Variable${variableControl}</label>
+    )}"/></label><label>Variable${variableControl}</label>${dimensionControls}
     <label>Value label<input name="valueLabel" value="${esc(
       cfg.valueLabel
     )}" placeholder="°C"/></label><label>Time dimension<input name="timeDimension" value="${esc(
@@ -1313,7 +1614,7 @@ function render() {
   panel.classList.add("ztsv-panel");
   panel.innerHTML = `<section class="ztsv-hero"><div class="ztsv-eyebrow">Zarr data cube</div><h2>${esc(
     cfg.name
-  )}</h2><p>${esc(cfg.variable)} · ${values.length} time steps</p></section>
+  )}</h2><p>${esc(displayedVariable())} · ${values.length} time steps</p></section>
     <div data-status class="ztsv-status">${
       layerId
         ? "Ready. Click the layer to chart a pixel."
@@ -1333,14 +1634,14 @@ function render() {
     cfg.climMax
   )}</span></div><div class="ztsv-legend-labels"><span>Low</span><span>High</span></div></section>
     <section class="ztsv-card ztsv-inspector"><div class="ztsv-section-title"><div><span class="ztsv-eyebrow">Pixel history</span><strong data-location>Click the map</strong></div><span data-current></span></div><svg data-chart class="ztsv-chart" viewBox="0 0 320 112" role="img" aria-label="${esc(
-      cfg.variable
+      displayedVariable()
     )} time-series chart"></svg><p data-summary class="ztsv-summary">Click inside the layer footprint to inspect all ${
     values.length
   } observations.</p><button data-export-pixel-plot class="ztsv-secondary" ${
     selectedSeries ? "" : "disabled"
   }>Export pixel plot as PNG</button></section>
     <section class="ztsv-card ztsv-details"><strong>About this dataset</strong><dl><div><dt>Variable</dt><dd>${esc(
-      cfg.variable
+      displayedVariable()
     )}</dd></div><div><dt>Time axis</dt><dd>${esc(cfg.timeDimension)} · ${
     values.length
   } steps</dd></div><div><dt>CRS</dt><dd>${esc(
@@ -1381,16 +1682,14 @@ function render() {
     ?.addEventListener("click", (event) => {
       const form = event.currentTarget.form;
       if (form?.elements.source.value === "local") {
-        try {
-          inspectLocalStore(form);
-        } catch (error) {
+        void inspectLocalStore(form).catch((error) =>
           status(
             error instanceof Error
               ? error.message
               : "Could not inspect this local Zarr store.",
             "error"
-          );
-        }
+          )
+        );
         return;
       }
       void inspectRemoteStore(form);
@@ -1414,6 +1713,11 @@ function render() {
         return;
       void switchVariable(form, event.currentTarget.value);
     });
+  for (const selector of panel.querySelectorAll("[data-dimension-selector]")) {
+    selector.addEventListener("change", (event) => {
+      void switchDimension(event.currentTarget.form);
+    });
+  }
   const folderInput = panel.querySelector("[data-folder-input]");
   panel
     .querySelector("[data-folder]")
@@ -1532,13 +1836,19 @@ const plugin = {
     });
     control = new ViewerControl();
     host.addMapControl(control, "top-right");
+    selectionUnregister = host.onSelectionChange?.(({ layerId: selectedId }) => {
+      if (selectedId) void activateRegisteredSeries(selectedId);
+    });
     host.openRightPanel?.(PANEL);
     if (!host.registerRightPanel && hasConfiguredSource()) void load();
     return true;
   },
   deactivate(host) {
     stop();
+    selectionSwitchToken += 1;
     queryController?.abort();
+    selectionUnregister?.();
+    selectionUnregister = null;
     const map = host.getMap?.();
     if (map && mapClick) map.off("click", mapClick);
     mapClick = null;
