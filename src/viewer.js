@@ -11,10 +11,11 @@ import {
 } from "./metadata.js";
 import { axisLabels, timeAxis } from "./time-axis.js";
 import { exportPixelPlotPng } from "./pixel-plot.js";
+import { datasetIdentity } from "./dataset-context.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.9";
+const VERSION = "0.7.10";
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -42,6 +43,8 @@ const PALETTES = {
 const DEFAULT_CONFIG = {
   source: "custom",
   url: "",
+  datasetKey: "",
+  localStoreId: "",
   name: "Zarr time series",
   variable: "",
   availableVariables: [],
@@ -133,12 +136,21 @@ function status(message, kind = "info") {
     element.dataset.kind = kind;
   }
 }
+
+function retainedLayersPrefix() {
+  const count = [...nativeLayers.values()].filter(
+    (registration) => registration.seriesKey
+  ).length;
+  return count
+    ? `${count} existing Zarr layer${count === 1 ? " was" : "s were"} retained. `
+    : "";
+}
 function sourceUrl(config) {
   if (config.source === "local") {
-    if (!localStore) throw new Error("Choose the Zarr folder again.");
+    if (!storeForConfig(config)) throw new Error("Choose the Zarr folder again.");
     return `local-zarr:${encodeURIComponent(
       config.url || "zarr"
-    )}?${localStoreId}`;
+    )}?${config.localStoreId || localStoreId}`;
   }
   return normalizeStoreUrl(config.url);
 }
@@ -208,7 +220,8 @@ function renderClim(config = cfg) {
 function hasConfiguredSource(config = cfg) {
   if (!String(config.variable ?? "").trim()) return false;
   if (!String(config.timeDimension ?? "").trim()) return false;
-  if (config.source === "local") return Boolean(localStore);
+  if (config.source === "local")
+    return Boolean(localStore && (config.localStoreId || localStoreId));
   return Boolean(String(config.url ?? "").trim());
 }
 
@@ -317,6 +330,9 @@ async function activateRegisteredSeries(id) {
   queryController?.abort();
   layerId = id;
   cfg = cloneConfig(registration.config);
+  localStore = registration.store ?? null;
+  localStoreId = cfg.localStoreId || "";
+  inspectedMetadata = registration.metadata ?? null;
   const axis = timeAxis(cfg);
   values = registration.values?.length ? [...registration.values] : axis.values;
   labels = registration.labels?.length
@@ -359,10 +375,7 @@ function datasetLayerName(config = cfg) {
 }
 
 function seriesLayerKey(config = cfg) {
-  const source =
-    config.source === "local"
-      ? `local:${localStoreId}:${config.url}`
-      : `remote:${normalizeStoreUrl(config.url)}`;
+  const source = config.datasetKey || datasetIdentity(config);
   const selection = (config.dimensionSelectors ?? [])
     .map((selector) => `${selector.name}=${String(selectedDimensionValue(selector))}`)
     .join("\u0001");
@@ -435,6 +448,8 @@ async function addNativeZarrLayer(name, config, selector, options = {}) {
     values: [],
     labels: [],
     frame: 0,
+    store: storeForConfig(config),
+    metadata: inspectedMetadata,
   });
   try {
     await layer.ready;
@@ -498,7 +513,7 @@ async function hydrateDimensionSelectors(config) {
   if (!(config.dimensionSelectors ?? []).length) return config;
   const store =
     config.source === "local"
-      ? localStore
+      ? storeForConfig(config)
       : new zarr.FetchStore(normalizeStoreUrl(config.url));
   if (!store) return config;
   const dimensionSelectors = await Promise.all(
@@ -524,6 +539,9 @@ async function hydrateDimensionSelectors(config) {
 }
 
 async function applyInspectedMetadata(metadata, next, zarrVersion) {
+  const activeConfig = nativeLayers.get(layerId)?.config;
+  const activeDatasetKey = activeConfig?.datasetKey ||
+    (activeConfig ? datasetIdentity(activeConfig) : "");
   inspectedMetadata = metadata;
   cfg = await hydrateDimensionSelectors(
     configFromMetadata(metadata, {
@@ -535,12 +553,23 @@ async function applyInspectedMetadata(metadata, next, zarrVersion) {
       mapBounds: "",
     })
   );
+  cfg.localStoreId = cfg.source === "local" ? next.localStoreId || localStoreId : "";
+  cfg.datasetKey = datasetIdentity(cfg);
+  const startsNewDataset = Boolean(
+    layerId && activeDatasetKey && cfg.datasetKey !== activeDatasetKey
+  );
+  if (startsNewDataset) {
+    stop();
+    queryController?.abort();
+    layerId = null;
+    selectedSeries = null;
+  }
   values = [];
   labels = [];
   render();
   panel?.querySelector(".ztsv-config")?.setAttribute("open", "");
   status(
-    `Found ${cfg.availableVariables.length} data variable${
+    `${startsNewDataset ? "New dataset ready; existing Zarr layers were retained. " : ""}Found ${cfg.availableVariables.length} data variable${
       cfg.availableVariables.length === 1 ? "" : "s"
     }. Select one, review the display range, then add the time series.`,
     "success"
@@ -590,13 +619,14 @@ async function inspectLocalStore(form) {
   );
 }
 async function inspectLocalDisplayRange() {
-  if (!localStore)
+  const store = storeForConfig(cfg);
+  if (!store)
     return { range: null, reason: "unavailable", values: 0 };
   if (cfg.hasDeclaredRange)
     return { range: null, reason: "declared", values: 0 };
   if (cfg.hasSuggestedRange)
     return { range: null, reason: "suggested", values: 0 };
-  const root = await zarr.open(localStore, { kind: "group" });
+  const root = await zarr.open(store, { kind: "group" });
   const array = await zarr.open(root.resolve(cfg.variable), { kind: "array" });
   const baseCoordinates = Array(array.shape.length).fill(0);
   for (const selector of cfg.dimensionSelectors ?? []) {
@@ -723,6 +753,7 @@ async function chooseFolder(fileList) {
       source: "local",
       url: storeName,
       name: storeName,
+      localStoreId,
     },
     discovered.zarrVersion
   );
@@ -730,21 +761,21 @@ async function chooseFolder(fileList) {
   const result = await applyLocalDisplayRange();
   if (result.range) {
     status(
-      `Found ${cfg.availableVariables.length} data variable${
+      `${retainedLayersPrefix()}Found ${cfg.availableVariables.length} data variable${
         cfg.availableVariables.length === 1 ? "" : "s"
       } and derived a robust display range of ${result.range[0].toLocaleString()} to ${result.range[1].toLocaleString()} from the 2nd–98th percentiles of a small sample.`,
       "success"
     );
   } else if (result.reason === "suggested") {
     status(
-      `Found ${cfg.availableVariables.length} data variable${
+      `${retainedLayersPrefix()}Found ${cfg.availableVariables.length} data variable${
         cfg.availableVariables.length === 1 ? "" : "s"
       }. Using the standard NDVI display range of -1 to 1.`,
       "success"
     );
   } else {
     status(
-      `Found ${cfg.availableVariables.length} data variable${
+      `${retainedLayersPrefix()}Found ${cfg.availableVariables.length} data variable${
         cfg.availableVariables.length === 1 ? "" : "s"
       }. Review the display range before adding the time series.`,
       "success"
@@ -1336,11 +1367,20 @@ async function load(next = cfg, options = {}) {
 function readForm(form) {
   const data = new FormData(form),
     get = (key) => String(data.get(key) ?? "");
+  const source = get("source");
+  const url = get("url");
+  const nextLocalStoreId =
+    source === "local" ? cfg.localStoreId || localStoreId : "";
   const variable = get("variable");
   const sameGrid = variable === cfg.gridVariable;
   return {
-    source: get("source"),
-    url: get("url"),
+    source,
+    url,
+    datasetKey: datasetIdentity(
+      { source, url, localStoreId: nextLocalStoreId },
+      nextLocalStoreId
+    ),
+    localStoreId: nextLocalStoreId,
     name: get("name"),
     variable,
     availableVariables: cfg.availableVariables ?? [],
@@ -1661,6 +1701,7 @@ function render() {
     ?.addEventListener("change", (event) => {
       if (event.currentTarget.value !== "custom") return;
       localStore = null;
+      localStoreId = "";
       inspectedMetadata = null;
       const form = event.currentTarget.form;
       form.elements.url.value = "";
@@ -1863,6 +1904,8 @@ const plugin = {
     metadataController?.abort();
     metadataController = null;
     inspectedMetadata = null;
+    localStore = null;
+    localStoreId = "";
     app = null;
   },
   getProjectState() {
