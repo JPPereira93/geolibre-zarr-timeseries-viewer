@@ -50,6 +50,23 @@ function shorten(value, limit = 32) {
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
+function wrapText(context, value, maxWidth) {
+  const lines = [];
+  let line = "";
+  for (const word of String(value).split(/\s+/)) {
+    // Split long identifiers too, so labels without spaces cannot overflow.
+    for (const part of word.match(/.{1,24}/gu) ?? []) {
+      const next = line ? `${line} ${part}` : part;
+      if (line && context.measureText(next).width > maxWidth) {
+        lines.push(line);
+        line = part;
+      } else line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 function canvasBlob(canvas) {
   return new Promise((resolve, reject) => {
     canvas.toBlob(
@@ -75,14 +92,26 @@ export async function exportPixelPlotPng({
   const axis = pixelPlotLabels(config, labels);
   const width = 1600;
   const height = 900;
-  const margin = { top: 145, right: 70, bottom: 155, left: 155 };
-  const plotWidth = width - margin.left - margin.right;
-  const plotHeight = height - margin.top - margin.bottom;
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
   const context = canvas.getContext("2d");
   if (!context) throw new Error("Canvas rendering is unavailable.");
+  context.font = "600 24px system-ui, sans-serif";
+  const yLabelLines = wrapText(context, axis.y, 560);
+  const xLabelLines = wrapText(context, axis.x, 1000);
+  context.font = "20px system-ui, sans-serif";
+  const tickWidth = Math.max(...Array.from({ length: 6 }, (_, i) =>
+    context.measureText(compactNumber(yMax - (i / 5) * (yMax - yMin))).width
+  ));
+  const margin = {
+    top: 145,
+    right: 110,
+    bottom: 125 + xLabelLines.length * 30,
+    left: Math.max(155, 50 + yLabelLines.length * 30 + tickWidth + 18),
+  };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
 
   context.fillStyle = "#ffffff";
   context.fillRect(0, 0, width, height);
@@ -120,7 +149,7 @@ export async function exportPixelPlotPng({
 
   const count = Math.max(series.length, labels.length, 1);
   const xTickCount = Math.min(6, count);
-  context.textAlign = "right";
+  context.textAlign = "center";
   context.textBaseline = "top";
   for (let tick = 0; tick < xTickCount; tick += 1) {
     const index =
@@ -132,10 +161,11 @@ export async function exportPixelPlotPng({
     context.lineTo(x, margin.top + plotHeight + 9);
     context.stroke();
     context.save();
-    context.translate(x + 4, margin.top + plotHeight + 18);
-    context.rotate(-Math.PI / 6);
+    context.translate(x, margin.top + plotHeight + 18);
+    context.textAlign = tick === 0 ? "left" : tick === xTickCount - 1 ? "right" : "center";
     context.fillStyle = "#374151";
-    context.fillText(shorten(labels[index] ?? index + 1), 0, 0);
+    const tickLines = wrapText(context, labels[index] ?? index + 1, plotWidth / 6 - 16);
+    tickLines.slice(0, 2).forEach((line, i) => context.fillText(line, 0, i * 25));
     context.restore();
   }
 
@@ -166,11 +196,14 @@ export async function exportPixelPlotPng({
   context.font = "600 24px system-ui, sans-serif";
   context.textAlign = "center";
   context.textBaseline = "alphabetic";
-  context.fillText(axis.x, margin.left + plotWidth / 2, height - 70);
+  xLabelLines.forEach((line, i) =>
+    context.fillText(line, margin.left + plotWidth / 2,
+      height - 65 - (xLabelLines.length - 1 - i) * 30)
+  );
   context.save();
-  context.translate(42, margin.top + plotHeight / 2);
+  context.translate(35, margin.top + plotHeight / 2);
   context.rotate(-Math.PI / 2);
-  context.fillText(axis.y, 0, 0);
+  yLabelLines.forEach((line, i) => context.fillText(line, 0, i * 30));
   context.restore();
 
   context.fillStyle = "#6b7280";

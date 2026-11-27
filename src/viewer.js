@@ -9,13 +9,13 @@ import {
   normalizeStoreUrl,
   readRemoteMetadata,
 } from "./metadata.js";
-import { axisLabels, timeAxis } from "./time-axis.js";
+import { axisLabels, timeAxis, yearMarkers } from "./time-axis.js";
 import { exportPixelPlotPng } from "./pixel-plot.js";
 import { datasetIdentity } from "./dataset-context.js";
 
 const ID = "zarr-timeseries-viewer";
 const PANEL = "zarr-timeseries-viewer-panel";
-const VERSION = "0.7.10";
+const VERSION = "0.7.11";
 const PALETTES = {
   ndvi: [
     "#7f3b08",
@@ -914,18 +914,25 @@ function chart(series) {
     drawing = true;
   });
   const mean = valid.reduce((sum, item) => sum + item, 0) / valid.length;
+  const years = yearMarkers(values, cfg);
+  const yearGrid = years.map(({ year, index }, tick) => {
+    const x = 10 + (index / Math.max(1, values.length - 1)) * 300;
+    const anchor = x < 22 ? "start" : x > 298 ? "end" : "middle";
+    return `<line x1="${x}" y1="12" x2="${x}" y2="92" class="ztsv-grid"/><text x="${x}" y="${years.length > 12 && tick % 2 ? 120 : 108}" text-anchor="${anchor}">${year}</text>`;
+  }).join("");
+  svg.setAttribute("viewBox", `0 0 320 ${years.length > 12 ? 126 : 112}`);
   summary.textContent = `Min ${Math.min(...valid).toFixed(
     3
   )} · Mean ${mean.toFixed(3)} · Max ${Math.max(...valid).toFixed(3)}`;
-  svg.innerHTML = `<line x1="10" y1="12" x2="310" y2="12" class="ztsv-grid"/><line x1="10" y1="92" x2="310" y2="92" class="ztsv-axis"/><path d="${path}" class="ztsv-line"/><line data-cursor y1="10" y2="94" class="ztsv-cursor"/><text x="12" y="21">${esc(
+  svg.innerHTML = `${yearGrid}<line x1="10" y1="12" x2="310" y2="12" class="ztsv-grid"/><line x1="10" y1="92" x2="310" y2="92" class="ztsv-axis"/><path d="${path}" class="ztsv-line"/><line data-cursor y1="10" y2="94" class="ztsv-cursor"/><text x="12" y="21">${esc(
     max.toFixed(2)
   )}</text><text x="12" y="88">${esc(
     min.toFixed(2)
-  )}</text><text x="10" y="108">${esc(
+  )}</text>${years.length ? "" : `<text x="10" y="108">${esc(
     labels[0]
   )}</text><text x="310" y="108" text-anchor="end">${esc(
     labels.at(-1)
-  )}</text>`;
+  )}</text>`}`;
   updateUi();
 }
 async function inspect(longitude, latitude) {
@@ -1432,6 +1439,7 @@ async function switchVariable(form, variable) {
       configFromMetadata(inspectedMetadata, {
         ...readForm(form),
         variable,
+        valueLabel: "",
       })
     );
     if (!hasActiveLayer) {

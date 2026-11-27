@@ -493,7 +493,7 @@ export function configFromMetadata(metadata, current = {}) {
       variableAttrs.long_name ??
       variableAttrs.standard_name ??
       variableAttrs.units ??
-      (current.variable === selected.name && current.valueLabel
+      ((current.gridVariable ?? current.variable) === selected.name && current.valueLabel
         ? current.valueLabel
         : selected.name),
     dimensions,
@@ -503,9 +503,8 @@ export function configFromMetadata(metadata, current = {}) {
     timeStart: 0,
     timeStep: 1,
     timeValuesText: "",
-    ...(units
-      ? { dateUnit: units[1].toLowerCase(), dateOrigin: units[2] }
-      : {}),
+    dateUnit: units ? units[1].toLowerCase() : "days",
+    dateOrigin: units ? units[2] : "",
     xDimension,
     yDimension,
     gridVariable: selected.name,

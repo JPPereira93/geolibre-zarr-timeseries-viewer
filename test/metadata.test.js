@@ -62,9 +62,9 @@ test("discovers variables and dimensions in a consolidated v2 store", async () =
   const precipitation = configFromMetadata(discovered.metadata, {
     ...config,
     variable: "precipitation",
-    valueLabel: "",
   });
   assert.equal(precipitation.variable, "precipitation");
+  assert.equal(precipitation.valueLabel, "precipitation");
   assert.equal(precipitation.gridVariable, "precipitation");
 });
 
@@ -405,6 +405,31 @@ test("builds time axes longer than ten thousand coordinates", () => {
   assert.equal(axis.values.length, 14367);
   assert.equal(axis.values.at(-1), 14366);
   assert.equal(axis.labels.at(-1), "time 14366");
+});
+
+test("switches between dated observations and annual coordinates without leaking date units", () => {
+  const metadata = {
+    "time/.zattrs": { units: "days since 2016-01-14" },
+    "year/.zattrs": {},
+    "evi/.zarray": { shape: [727, 3, 3] },
+    "evi/.zattrs": { _ARRAY_DIMENSIONS: ["time", "y", "x"] },
+    "longest_gap_days/.zarray": { shape: [10, 3, 3] },
+    "longest_gap_days/.zattrs": { _ARRAY_DIMENSIONS: ["year", "y", "x"] },
+  };
+  const observations = configFromMetadata(metadata, { variable: "evi" });
+  assert.equal(observations.dateOrigin, "2016-01-14");
+  const annual = configFromMetadata(metadata, {
+    ...observations,
+    variable: "longest_gap_days",
+  });
+  assert.equal(annual.timeDimension, "year");
+  assert.equal(annual.dateOrigin, "");
+  const axis = timeAxis({ ...annual, timeValuesText: "2016,2017,2025" });
+  assert.deepEqual(axis.values, [2016, 2017, 2025]);
+  assert.deepEqual(axis.labels, ["year 2016", "year 2017", "year 2025"]);
+  const restored = configFromMetadata(metadata, { ...annual, variable: "evi" });
+  assert.equal(restored.dateOrigin, "2016-01-14");
+  assert.equal(restored.dateUnit, "days");
 });
 
 test("rejects invalid generated time counts", () => {

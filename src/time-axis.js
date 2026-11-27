@@ -1,3 +1,20 @@
+export function yearMarkers(axis, config) {
+  const origin = Date.parse(config.dateOrigin);
+  const unit = { milliseconds: 1, seconds: 1e3, minutes: 6e4, hours: 36e5, days: 864e5 }[config.dateUnit];
+  const annual = /^years?$/i.test(config.timeDimension);
+  const markers = [];
+  let previousYear;
+  axis.forEach((value, index) => {
+    const year = annual ? Number(value)
+      : Number.isFinite(origin) && unit && typeof value === "number"
+      ? new Date(origin + value * unit).getUTCFullYear() : NaN;
+    if (!Number.isInteger(year)) return;
+    if (year !== previousYear) markers.push({ year, index });
+    previousYear = year;
+  });
+  return markers;
+}
+
 export function axisLabels(axis, config) {
   const origin = Date.parse(config.dateOrigin);
   const unit =
